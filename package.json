@@ -19,5 +19,8 @@
   "devDependencies": {
     "concurrently": "^9.0.1",
     "vite": "^5.4.21"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

@@ -5,7 +5,7 @@ services:
     name: arena-seven
     runtime: node
     plan: free
-    buildCommand: npm install && npm run build
+    buildCommand: npm ci --include=dev && npm run build
     startCommand: npm run server
     healthCheckPath: /health
     envVars:
