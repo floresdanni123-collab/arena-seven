@@ -61,11 +61,14 @@ export class SetPieceManager {
       if (p.isGoalkeeper && p.ai) { p.ai.threat = null; p.ai.mode = 'POSITION'; p.ai.holdLine = spec.type === RESTART.PENALTY && p.team !== spec.team; }
     }
 
-    // Human control: take our own set pieces (goal kicks stay with the keeper unless the user switches).
-    if (taker.team === m.human.team && !taker.isHuman && spec.type !== RESTART.GOAL_KICK) m.switcher.switchTo(taker, { reason: 'setpiece' });
-    if (spec.shootout && taker.team !== m.human.team) {
-      const gk = m.teamManager.getGoalkeeper(m.human.team);
-      if (gk && gk.active && !gk.isHuman) m.switcher.switchTo(gk, { reason: 'shootout' });
+    // Human control: a human takes their own team's set pieces (goal kicks stay with the keeper unless
+    // the user switches). In a shootout the defending team's human takes their goalkeeper.
+    for (const slot of m.slotList()) {
+      if (slot.team === taker.team && !taker.isHuman && spec.type !== RESTART.GOAL_KICK) slot.switcher.switchTo(taker, { reason: 'setpiece' });
+      if (spec.shootout && slot.team !== taker.team) {
+        const gk = m.teamManager.getGoalkeeper(slot.team);
+        if (gk && gk.active && !gk.isHuman) slot.switcher.switchTo(gk, { reason: 'shootout' });
+      }
     }
     this.applyControllerMode();
 
@@ -83,10 +86,8 @@ export class SetPieceManager {
     if (spec.type === RESTART.GOAL_KICK) return candidates.find((p) => p.isGoalkeeper) || candidates[0];
     if (spec.preferredTaker && spec.preferredTaker.active) return spec.preferredTaker;
     const outfield = candidates.filter((p) => !p.isGoalkeeper);
-    if (team === m.human.team) {
-      if (!m.human.isGoalkeeper && spec.type !== RESTART.PENALTY) return m.human;
-      if (spec.type === RESTART.PENALTY && !m.human.isGoalkeeper) return m.human;
-    }
+    const hu = m.humans[team];
+    if (hu && hu.active && !hu.isGoalkeeper) return hu;
     if (spec.type === RESTART.PENALTY) {
       // best attacker available
       const order = { ATT: 0, MID: 1, DEF: 2 };
@@ -98,14 +99,16 @@ export class SetPieceManager {
   applyControllerMode() {
     const m = this.match;
     const cur = this.current;
-    const isTaker = cur && m.human === cur.taker;
-    let mode = 'normal';
-    if (cur) {
-      if (isTaker) mode = cur.type === RESTART.THROW_IN ? 'throwin' : cur.type === RESTART.PENALTY ? 'penalty' : 'setpiece';
-      else mode = 'hold';
+    for (const slot of m.slotList()) {
+      const isTaker = cur && slot.human === cur.taker;
+      let mode = 'normal';
+      if (cur) {
+        if (isTaker) mode = cur.type === RESTART.THROW_IN ? 'throwin' : cur.type === RESTART.PENALTY ? 'penalty' : 'setpiece';
+        else mode = 'hold';
+      }
+      slot.controller.mode = mode;
+      slot.gkController.mode = mode === 'hold' ? 'setpiece' : mode;
     }
-    m.controller.mode = mode;
-    m.gkController.mode = mode === 'hold' ? 'setpiece' : mode;
   }
 
   /* ------------------------------------------------------------ update */
@@ -119,8 +122,26 @@ export class SetPieceManager {
       case 'SETUP': this.updateSetup(dt); break;
       case 'READY': this.updateReady(dt); break;
       case 'RUNUP': this.updateRunup(dt); break;
+      case 'KICKING': this.updateKicking(dt); break;
       default: break;
     }
+  }
+
+  /** Watchdog: a refused kick (ball not in reach) must never leave the restart hanging. */
+  updateKicking(dt) {
+    const cur = this.current;
+    cur.kickWatch = (cur.kickWatch || 0) + dt;
+    if (cur.kicked || cur.kickWatch < 2.0) return;
+    cur.kickWatch = 0;
+    cur.retries = (cur.retries || 0) + 1;
+    const taker = cur.taker;
+    if (cur.retries > 2) { this.complete(); return; }
+    // Re-seat the taker behind the ball along their facing and try again.
+    taker.resetState();
+    taker.position.copy(cur.position).addScaledVector(taker.facingDir, -0.9); taker.position.y = 0;
+    taker.velocity.set(0, 0, 0);
+    cur.phase = 'READY'; cur.timer = 0; cur.aiDelay = 0.3; cur.shot = null;
+    this.applyControllerMode();
   }
 
   updateSetup(dt) {
@@ -133,11 +154,15 @@ export class SetPieceManager {
       if (p.isHuman) this.driveTo(p, p.placement, dt); // AI players drive themselves via placement
       if (d > 0.7) ready = false;
     }
-    if (ready || cur.timer > SET_PIECE.SETUP_TIMEOUT) {
+    // The taker must be at the ball before the restart can go ahead: wait for them a little longer
+    // than everyone else (they may have been far away), then seat them at the spot regardless.
+    const takerDist = cur.taker.placement ? cur.taker.position.distanceTo(cur.taker.placement) : 0;
+    const takerClose = takerDist < 3.5;
+    if (ready || (cur.timer > SET_PIECE.SETUP_TIMEOUT && takerClose) || cur.timer > SET_PIECE.SETUP_TIMEOUT + 3.5) {
       // Nudge stragglers the last bit so nobody is stuck inside the exclusion zone.
       for (const p of m.players) {
         if (!p.placement || !p.active) continue;
-        if (p.position.distanceTo(p.placement) < 3.5) { p.position.copy(p.placement); p.velocity.set(0, 0, 0); }
+        if (p === cur.taker || p.position.distanceTo(p.placement) < 3.5) { p.position.copy(p.placement); p.velocity.set(0, 0, 0); }
         p.setMoveInput(0, 0, false);
         this.facePlayer(p);
       }
@@ -171,7 +196,7 @@ export class SetPieceManager {
       m.possession.locked = true;
       m.ball.frozen = false;
     }
-    if (taker.isHuman) { m.camera.setTarget(taker, false); m.camera.yaw = taker.facing; }
+    if (taker === m.human && m.camera) { m.camera.setTarget(taker, false); m.camera.yaw = taker.facing; }
     this.events.emit('set_piece_ready', { type: cur.type, taker });
   }
 
@@ -185,7 +210,9 @@ export class SetPieceManager {
       return;
     }
     // Human penalty: wait for the controller to hand us a shot request.
-    if (cur.type === RESTART.PENALTY && cur.shot) this.enterRunup();
+    if (cur.type === RESTART.PENALTY && cur.shot) { this.enterRunup(); return; }
+    // An idle human (AFK, tabbed out, online opponent waiting) must not freeze the match forever.
+    if (cur.timer >= SET_PIECE.HUMAN_TAKE_TIMEOUT) { this.events.emit('toast', { text: 'RESTART TAKEN AUTOMATICALLY' }); this.aiTake(); }
   }
 
   /** Human penalty input arrives here (from the controller). */
@@ -201,7 +228,7 @@ export class SetPieceManager {
     cur.phase = 'RUNUP';
     cur.timer = 0;
     cur.taker.locked = false;
-    this.match.controller.mode = 'hold';
+    for (const slot of this.match.slotList()) slot.controller.mode = 'hold';
   }
 
   updateRunup(dt) {
@@ -354,6 +381,7 @@ export class SetPieceManager {
     if (p === cur.taker) {
       if (cur.type === RESTART.THROW_IN) tmp.set(-Math.sign(p.position.x || 1), 0, 0);
       else if (cur.type === RESTART.GOAL_KICK) tmp.set(0, 0, FormationSystem.attackDir(p.team));
+      else if (cur.type === RESTART.CORNER) SetPiecePlacements.attackGoalPoint(p.team, 0, 8, tmp).sub(p.position).setY(0); // face the box, ball in front
       else tmp.set(0, 0, FormationSystem.attackDir(p.team) * PITCH.HALF_LENGTH).sub(p.position).setY(0);
     } else {
       tmp.subVectors(m.ball.position, p.position).setY(0);
@@ -395,8 +423,7 @@ export class SetPieceManager {
     m.possession.locked = false;
     m.ball.frozen = false;
     this.current = null;
-    m.controller.mode = 'normal';
-    m.gkController.mode = 'normal';
-    m.camera.setRig(m.human.isGoalkeeper ? 'keeper' : 'player');
+    for (const slot of m.slotList()) { slot.controller.mode = 'normal'; slot.gkController.mode = 'normal'; }
+    if (m.camera && m.human) m.camera.setRig(m.human.isGoalkeeper ? 'keeper' : 'player');
   }
 }

@@ -152,8 +152,9 @@ export const SetPiecePlacements = {
     const dir = FormationSystem.attackDir(team);
     const sideX = Math.sign(spec.position.x) || 1;    // which corner (world x sign)
     const sx = sideX * dir;                            // in team space, +1 means the corner is on the "left" (team-space x)
-    const inward = new THREE.Vector3(-sideX, 0, -dir).normalize();
-    map.set(taker, this.clampPitch(spec.position.clone().addScaledVector(inward, 0.8)));
+    // Taker stands just outside the corner, behind the ball relative to the delivery, so the ball is
+    // in front of them whichever way into the box they aim (deliberately not clamped to the pitch).
+    map.set(taker, spec.position.clone().add(new THREE.Vector3(sideX * 0.6, 0, dir * 0.6)));
 
     const mates = this.outfield(match, team, taker).sort((a, b) => a.position.distanceTo(spec.position) - b.position.distanceTo(spec.position));
     const boxSpots = [

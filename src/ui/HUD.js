@@ -4,21 +4,20 @@ import { MATCH_STATE } from '../match/MatchManager.js';
 const ROLE_LABEL = { GK: 'GOALKEEPER', DEF: 'DEFENDER', MID: 'MIDFIELDER', ATT: 'ATTACKER' };
 const RESTART_LABEL = { [RESTART.FREE_KICK]: 'FREE KICK', [RESTART.PENALTY]: 'PENALTY', [RESTART.THROW_IN]: 'THROW-IN', [RESTART.CORNER]: 'CORNER', [RESTART.GOAL_KICK]: 'GOAL KICK', [RESTART.KICKOFF]: 'KICK OFF' };
 
-const OUTFIELD_HINTS = `
-  <div><kbd>WASD</kbd> MOVE &nbsp; <kbd>SHIFT</kbd> SPRINT</div>
-  <div><kbd>LMB</kbd> HARD KICK &nbsp; <kbd>RMB</kbd> HOLD: LOW KICK</div>
-  <div><kbd>E</kbd> SLIDE TACKLE &nbsp; <kbd>Q</kbd> JUKE</div>
-  <div><kbd>TAB</kbd> CYCLE PLAYER &nbsp; <kbd>SPACE</kbd> NEAREST &nbsp; <kbd>ESC</kbd> PAUSE</div>`;
-const KEEPER_HINTS = `
-  <div><kbd>WASD</kbd> MOVE &nbsp; <kbd>SHIFT</kbd> RUSH</div>
-  <div><kbd>LMB</kbd> DIVE / KICK &nbsp; <kbd>RMB</kbd> CATCH / THROW (HOLD)</div>
-  <div><kbd>E</kbd> SMOTHER &nbsp; <kbd>Q</kbd> SHUFFLE</div>
-  <div><kbd>TAB</kbd> CYCLE PLAYER &nbsp; <kbd>ESC</kbd> PAUSE</div>`;
-const SETPIECE_HINTS = {
-  throwin: `<div><kbd>MOUSE</kbd> AIM</div><div><kbd>RMB</kbd> HOLD: THROW POWER &nbsp; <kbd>LMB</kbd> STRONG THROW</div>`,
-  penalty: `<div><kbd>MOUSE</kbd> AIM</div><div><kbd>RMB</kbd> HOLD: PLACED SHOT &nbsp; <kbd>LMB</kbd> POWER SHOT</div>`,
-  setpiece: `<div><kbd>MOUSE</kbd> AIM</div><div><kbd>RMB</kbd> HOLD: DRIVEN KICK &nbsp; <kbd>LMB</kbd> HARD KICK</div><div><kbd>TAB</kbd> CYCLE PLAYER</div>`
+/**
+ * Control panel layouts. Each mode lists [key, action] rows; only actions possible in the current
+ * state are shown (e.g. a keeper holding the ball gets distribution controls instead of dive/catch).
+ */
+const CONTROL_LAYOUTS = {
+  OUTFIELD: { title: 'OUTFIELD', rows: [['WASD', 'MOVE'], ['SHIFT', 'SPRINT'], ['LMB', 'HARD KICK'], ['RMB', 'LOW KICK / HOLD FOR POWER'], ['E', 'SLIDE TACKLE'], ['Q', 'JUKE'], ['C', 'SHIFT LOCK'], ['TAB', 'SWITCH PLAYER'], ['SPACE', 'NEAREST PLAYER'], ['ESC', 'PAUSE']] },
+  GOALKEEPER: { title: 'GOALKEEPER', rows: [['WASD', 'MOVE'], ['SHIFT', 'SPRINT / RUSH'], ['LMB', 'DIVE / SAVE'], ['RMB', 'CATCH / SMOTHER'], ['E', 'RUSH / SMOTHER'], ['Q', 'QUICK SHUFFLE'], ['C', 'SHIFT LOCK'], ['TAB', 'SWITCH PLAYER'], ['ESC', 'PAUSE']] },
+  GOALKEEPER_BALL: { title: 'GOALKEEPER · BALL IN HANDS', rows: [['WASD', 'MOVE'], ['LMB', 'POWER KICK'], ['RMB', 'THROW / ROLL (HOLD FOR POWER)'], ['C', 'SHIFT LOCK'], ['TAB', 'SWITCH PLAYER'], ['ESC', 'PAUSE']] },
+  THROWIN: { title: 'THROW-IN', rows: [['MOUSE', 'AIM'], ['RMB', 'HOLD: THROW POWER'], ['LMB', 'STRONG THROW'], ['TAB', 'SWITCH PLAYER']] },
+  PENALTY: { title: 'PENALTY', rows: [['MOUSE', 'AIM'], ['RMB', 'HOLD: PLACED SHOT'], ['LMB', 'POWER SHOT']] },
+  SETPIECE: { title: 'SET PIECE', rows: [['MOUSE', 'AIM'], ['RMB', 'HOLD: DRIVEN KICK'], ['LMB', 'HARD KICK'], ['C', 'SHIFT LOCK'], ['TAB', 'SWITCH PLAYER']] },
+  HOLD: { title: 'RESTART', rows: [['MOUSE', 'LOOK'], ['TAB', 'SWITCH PLAYER']] }
 };
+const CONTROL_SWAP_MS = 160;
 
 /**
  * In-match heads-up display: scoreboard + clock, ability cooldowns, kick power meter, player tag,
@@ -39,6 +38,7 @@ export class HUD {
         </div>
         <div class="match-clock" data-clock>05:00</div>
         <div class="possession-bar"><div data-poss></div></div>
+        <div class="online-line hidden" data-online><span class="tag">ONLINE</span><span class="names" data-online-names></span><span class="ping" data-ping>PING --</span></div>
       </div>
       <div class="player-tag"><div class="num" data-pnum>10</div><div><div class="name" data-pname>YOU</div><div class="role" data-prole>ATTACKER</div></div></div>
       <div class="crosshair"></div>
@@ -52,6 +52,7 @@ export class HUD {
         <div class="ability" data-ability="juke"><div class="fill"></div><div class="key">Q</div><div class="name">JUKE</div><div class="status">READY</div></div>
       </div>
       <div class="controls-hint" data-controls></div>
+      <div class="shiftlock-ind" data-shiftlock><div class="key">C</div><div class="name">SHIFT LOCK</div><div class="status" data-sl-status>OFF</div></div>
       <div class="setpiece-banner" data-setpiece><div class="type" data-sp-type></div><div class="team" data-sp-team></div></div>
       <div class="card-popup" data-card><div class="card"></div><div class="who"><div class="cname" data-card-name></div><div class="creason" data-card-reason></div></div></div>
       <div class="shootout-panel" data-shootout>
@@ -90,12 +91,43 @@ export class HUD {
     this.setPieceTimer = null;
     this.cardTimer = null;
     this.lastPlayer = null;
-    this.lastHints = '';
+    this.controlMode = null;
+    this.controlSwapTimer = null;
+    this.shiftLockEl = this.q('[data-shiftlock]');
+    this.shiftLockOn = false;
+  }
+
+  /**
+   * Switch the control panel layout (OUTFIELD, GOALKEEPER, GOALKEEPER_BALL, THROWIN, PENALTY, SETPIECE,
+   * HOLD). The old rows fade/slide out and the new ones in over ~160ms; never both at once.
+   */
+  setControlMode(mode) {
+    if (mode === this.controlMode) return;
+    const layout = CONTROL_LAYOUTS[mode] || CONTROL_LAYOUTS.OUTFIELD;
+    this.controlMode = mode;
+    const html = `<div class="head">${layout.title}</div>` + layout.rows.map(([k, a]) => `<div class="row"><kbd>${k}</kbd><span>${a}</span></div>`).join('');
+    clearTimeout(this.controlSwapTimer);
+    const el = this.controlsEl;
+    if (!el.innerHTML) { el.innerHTML = html; return; }
+    el.classList.add('switching');
+    this.controlSwapTimer = setTimeout(() => {
+      el.innerHTML = html;
+      el.classList.remove('switching');
+    }, CONTROL_SWAP_MS);
+  }
+
+  setShiftLock(on, announce = false) {
+    this.shiftLockOn = on;
+    this.shiftLockEl.classList.toggle('on', on);
+    this.q('[data-sl-status]').textContent = on ? 'ON' : 'OFF';
+    if (announce) this.toast(on ? 'SHIFT LOCK ENABLED' : 'SHIFT LOCK DISABLED', 800);
   }
 
   show() { this.el.classList.remove('hidden'); this.controlsEl.classList.toggle('hidden', !this.settings.get('showControls')); }
   hide() { this.el.classList.add('hidden'); }
-  setPointerHint(v) { this.pointerEl.classList.toggle('hidden', !v); }
+  setPointerHint(v) { this.pointerEl.classList.toggle('hidden', !v || this.touchMode); }
+  /** Touch mode hides keyboard hints, ability boxes and the crosshair; the touch layer shows those instead. */
+  setTouchMode(v) { this.touchMode = v; this.el.classList.toggle('touch', v); if (v) this.pointerEl.classList.add('hidden'); }
 
   update(match, audio) {
     const p = match.human;
@@ -108,6 +140,16 @@ export class HUD {
       }
     }
     this.clockEl.textContent = match.clockText;
+    // Online header: names + ping (subtle, under the clock)
+    const online = !!match.online;
+    this.q('[data-online]').classList.toggle('hidden', !online);
+    if (online) {
+      const me = match.descriptor.you.name, opp = match.descriptor.opponent.name;
+      const blue = match.localTeam === 0 ? me : opp, red = match.localTeam === 1 ? me : opp;
+      const names = `${blue.toUpperCase()}  ·  ${red.toUpperCase()}`;
+      const el = this.q('[data-online-names]'); if (el.textContent !== names) el.textContent = names;
+      this.q('[data-ping]').textContent = `PING ${match.ping || 0}ms`;
+    }
     const remaining = match.duration - match.clock;
     this.clockEl.classList.toggle('urgent', isFinite(remaining) && remaining < 30 && match.state === MATCH_STATE.PLAYING);
     this.possEl.style.width = `${Math.round(match.possession.possessionShare() * 100)}%`;
@@ -119,11 +161,17 @@ export class HUD {
       this.lastPlayer = p;
     }
 
-    // Control hints follow the active controller and set-piece mode
+    // Control panel follows the controlled player type, keeper possession and set-piece mode.
     const mode = p.isGoalkeeper ? match.gkController.mode : match.controller.mode;
-    let hints = p.isGoalkeeper ? KEEPER_HINTS : OUTFIELD_HINTS;
-    if (SETPIECE_HINTS[mode]) hints = SETPIECE_HINTS[mode];
-    if (hints !== this.lastHints) { this.controlsEl.innerHTML = hints; this.lastHints = hints; }
+    const keeperHolding = p.isGoalkeeper && match.ball.owner === p && match.ball.state === 'GOALKEEPER_HELD';
+    let controlMode;
+    if (mode === 'throwin') controlMode = 'THROWIN';
+    else if (mode === 'penalty') controlMode = 'PENALTY';
+    else if (mode === 'setpiece') controlMode = 'SETPIECE';
+    else if (mode === 'hold') controlMode = 'HOLD';
+    else controlMode = p.isGoalkeeper ? (keeperHolding ? 'GOALKEEPER_BALL' : 'GOALKEEPER') : 'OUTFIELD';
+    this.setControlMode(controlMode);
+    if (match.shiftLock && match.shiftLock.enabled !== this.shiftLockOn) this.setShiftLock(match.shiftLock.enabled);
 
     // Abilities only apply to outfield players
     this.abilitiesEl.classList.toggle('hidden', p.isGoalkeeper);
@@ -230,5 +278,6 @@ export class HUD {
     this.lastScore = [0, 0]; this.scoreEls[0].textContent = '0'; this.scoreEls[1].textContent = '0'; this.lastPlayer = null;
     this.hideSetPiece(); this.setShootout(null); this.setReplay(false); this.hideBanner();
     this.cardEl.classList.remove('show');
+    clearTimeout(this.controlSwapTimer); this.controlMode = null; this.controlsEl.innerHTML = ''; this.controlsEl.classList.remove('switching');
   }
 }

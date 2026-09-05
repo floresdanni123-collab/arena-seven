@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { CHANNEL_COUNT } from './ProceduralHumanoid.js';
+import { CHANNEL_COUNT, CH } from './ProceduralHumanoid.js';
 import { PROCEDURAL_CLIPS } from './ProceduralClips.js';
 import { PLAYER } from '../utils/Constants.js';
 import { clamp, damp, rand } from '../utils/MathUtils.js';
@@ -51,14 +51,15 @@ class ProceduralBackend {
     this.isKeeper = false;
   }
 
-  setLocomotion({ speed, sprinting, hasBall, isKeeper }) {
+  setLocomotion({ speed, sprinting, hasBall, isKeeper, forwardFactor = 1, strafe = 0 }) {
     this.speed = speed; this.sprinting = sprinting; this.hasBall = hasBall; this.isKeeper = isKeeper;
+    this.forwardFactor = forwardFactor; this.strafe = strafe;
   }
 
-  playAction(name, { fade = 0.1, duration, params = {} } = {}) {
+  playAction(name, { fade = 0.1, duration, params = {}, startAt = 0 } = {}) {
     const clip = PROCEDURAL_CLIPS[name];
     if (!clip) { console.warn('[Anim] unknown procedural clip', name); return false; }
-    this.action = { name, clip, t: 0, fade, duration: duration || clip.duration || 1, params, finished: false, hold: !!clip.hold, fadingOut: false };
+    this.action = { name, clip, t: startAt, fade, duration: duration || clip.duration || 1, params, finished: false, hold: !!clip.hold, fadingOut: false };
     return true;
   }
 
@@ -77,7 +78,12 @@ class ProceduralBackend {
     for (let i = 0; i < 4; i++) this.weights[i] = damp(this.weights[i], target[i], 12, dt);
     const sum = this.weights[0] + this.weights[1] + this.weights[2] + this.weights[3] || 1;
     const stride = strideLength(this.speed);
-    this.phase = (this.phase + (this.speed / stride) * dt) % 1;
+    // Direction-aware locomotion (shift lock): backpedalling runs the gait cycle in reverse, strafing
+    // leans the body into the step. Both are damped so the pose never jumps between frames.
+    this.backMix = damp(this.backMix || 0, (this.forwardFactor ?? 1) < -0.35 ? 1 : 0, 10, dt);
+    this.strafeMix = damp(this.strafeMix || 0, clamp(this.strafe || 0, -1, 1), 10, dt);
+    const dirSign = this.backMix > 0.5 ? -1 : 1;
+    this.phase = ((this.phase + dirSign * (this.speed / stride) * dt) % 1 + 1) % 1;
     this.dribbleMix = damp(this.dribbleMix, this.hasBall ? 1 : 0, 8, dt);
     this.keeperMix = damp(this.keeperMix, this.isKeeper ? 1 : 0, 8, dt);
 
@@ -137,6 +143,19 @@ class ProceduralBackend {
     }
     aw = this.action ? this.actionWeight : 0;
 
+    // Strafe lean: hips/spine tip into the sidestep, arms swing less. Scaled by how much we are moving.
+    const gaitAmt = (1 - idleW) * (1 - aw);
+    if (Math.abs(this.strafeMix) > 0.01 && gaitAmt > 0.01) {
+      const s = this.strafeMix * gaitAmt;
+      loco[CH.hipsRZ] -= s * 0.16; loco[CH.spineRZ] -= s * 0.1; loco[CH.headRZ] += s * 0.06;
+      loco[CH.lHipRZ] += s * 0.22; loco[CH.rHipRZ] += s * 0.22;
+      loco[CH.lShoulderRX] *= 1 - Math.abs(s) * 0.6; loco[CH.rShoulderRX] *= 1 - Math.abs(s) * 0.6;
+      loco[CH.lHipRX] *= 1 - Math.abs(s) * 0.35; loco[CH.rHipRX] *= 1 - Math.abs(s) * 0.35;
+    }
+    if (this.backMix > 0.01 && gaitAmt > 0.01) {
+      const b = this.backMix * gaitAmt;
+      loco[CH.spineRX] -= b * 0.28; loco[CH.headRX] += b * 0.1; // lean back slightly when backpedalling
+    }
     const f = this.finalPose;
     for (let i = 0; i < CHANNEL_COUNT; i++) f[i] = loco[i] * (1 - aw) + this.actionPose[i] * aw;
     this.humanoid.applyPose(f);
@@ -183,7 +202,7 @@ class MixerBackend {
     this.clips = clips; // Map name -> AnimationClip
     this.actions = new Map();
     this.loco = {};
-    const locoNames = ['idle', 'walk', 'jog', 'sprint', 'dribble', 'gkIdle', 'gkMove'];
+    const locoNames = ['idle', 'walk', 'jog', 'sprint', 'dribble', 'gkIdle', 'gkMove', 'strafeLeft', 'strafeRight', 'backpedal'];
     for (const n of locoNames) {
       const clip = this.resolve(n);
       if (!clip) continue;
@@ -210,14 +229,17 @@ class MixerBackend {
     return null;
   }
 
-  setLocomotion({ speed, hasBall, isKeeper }) { this.speed = speed; this.hasBall = hasBall; this.isKeeper = isKeeper; }
+  setLocomotion({ speed, hasBall, isKeeper, forwardFactor = 1, strafe = 0 }) {
+    this.speed = speed; this.hasBall = hasBall; this.isKeeper = isKeeper; this.forwardFactor = forwardFactor; this.strafe = strafe;
+  }
 
-  playAction(name, { fade = 0.1, duration, hold } = {}) {
+  playAction(name, { fade = 0.1, duration, hold, startAt = 0 } = {}) {
     const clip = this.resolve(name);
     if (!clip) return false;
     if (this.action) { this.action.act.fadeOut(0.05); }
     const act = this.mixer.clipAction(clip);
     act.reset();
+    if (startAt > 0) act.time = startAt;
     act.setLoop(THREE.LoopOnce, 1);
     act.clampWhenFinished = true;
     act.enabled = true;
@@ -248,12 +270,23 @@ class MixerBackend {
     const [wi, ww, wj, ws] = this.weights;
     const out = 1 - this.keeperMix, kp = this.keeperMix;
     const set = (n, w, timeScale = 1) => { const a = this.loco[n]; if (!a) return; a.setEffectiveWeight(w * locoScale); a.timeScale = timeScale; };
+    // Directional clips (only when the rig provides them): strafe left/right and backpedal take over
+    // part of the jog weight while the player moves sideways / backwards under shift lock.
+    this.strafeMix = damp(this.strafeMix || 0, clamp(this.strafe || 0, -1, 1), 10, dt);
+    this.backMix = damp(this.backMix || 0, (this.forwardFactor ?? 1) < -0.35 ? 1 : 0, 10, dt);
+    const hasStrafe = !!(this.loco.strafeLeft || this.loco.strafeRight), hasBack = !!this.loco.backpedal;
+    const strafeAmt = hasStrafe ? Math.abs(this.strafeMix) : 0, backAmt = hasBack ? this.backMix : 0;
+    const gaitW = ww + wj + ws;
+    const dirShare = Math.min(1, strafeAmt + backAmt);
+    set('strafeLeft', gaitW * out * (this.strafeMix > 0 ? strafeAmt : 0) * (1 - backAmt), clamp(this.speed / PLAYER.RUN_SPEED, 0.6, 1.4));
+    set('strafeRight', gaitW * out * (this.strafeMix < 0 ? strafeAmt : 0) * (1 - backAmt), clamp(this.speed / PLAYER.RUN_SPEED, 0.6, 1.4));
+    set('backpedal', gaitW * out * backAmt, clamp(this.speed / PLAYER.RUN_SPEED, 0.6, 1.4));
     set('idle', wi * out);
     set('gkIdle', wi * kp);
-    set('walk', ww * out, clamp(this.speed / PLAYER.WALK_SPEED, 0.6, 1.4));
-    set('jog', wj * out * (1 - this.dribbleMix), clamp(this.speed / PLAYER.RUN_SPEED, 0.7, 1.3));
-    set('dribble', (wj + ws * 0.5) * out * this.dribbleMix, clamp(this.speed / PLAYER.RUN_SPEED, 0.7, 1.4));
-    set('sprint', ws * out * (1 - this.dribbleMix * 0.5), clamp(this.speed / PLAYER.SPRINT_SPEED, 0.8, 1.2));
+    set('walk', ww * out * (1 - dirShare), clamp(this.speed / PLAYER.WALK_SPEED, 0.6, 1.4));
+    set('jog', wj * out * (1 - this.dribbleMix) * (1 - dirShare), clamp(this.speed / PLAYER.RUN_SPEED, 0.7, 1.3));
+    set('dribble', (wj + ws * 0.5) * out * this.dribbleMix * (1 - dirShare), clamp(this.speed / PLAYER.RUN_SPEED, 0.7, 1.4));
+    set('sprint', ws * out * (1 - this.dribbleMix * 0.5) * (1 - dirShare), clamp(this.speed / PLAYER.SPRINT_SPEED, 0.8, 1.2));
     set('gkMove', (ww + wj + ws) * kp, clamp(this.speed / PLAYER.WALK_SPEED, 0.7, 1.6));
     this.mixer.update(dt);
   }
@@ -280,22 +313,56 @@ class MixerBackend {
   dispose() { this.mixer.stopAllAction(); }
 }
 
+/* ============================================================== headless backend (server) */
+
+/** No visuals: only tracks which one-shot action is running so it can be replicated to clients. */
+class HeadlessBackend {
+  constructor() { this.action = null; this.time = 0; }
+  setLocomotion() {}
+  playAction(name, { duration } = {}) {
+    const clip = PROCEDURAL_CLIPS[name];
+    this.action = { name, t: 0, duration: duration || (clip && clip.duration) || 1, finished: false, hold: !!(clip && clip.hold) };
+    return true;
+  }
+  stopAction() { this.action = null; }
+  update(dt) {
+    if (!this.action) return;
+    this.action.t += dt;
+    if (this.action.t >= this.action.duration) { this.action.finished = true; if (!this.action.hold) this.action = null; }
+  }
+  isActionFinished() { return !this.action || this.action.finished; }
+  get currentAction() { return this.action; }
+  captureState() { return null; }
+  applyState() {}
+  dispose() {}
+}
+
 /* ============================================================== facade */
 
 /**
- * Uniform animation API for a player regardless of whether it is driven by procedural clips or a
- * GLB rig with AnimationMixer. Game code only talks to this class.
+ * Uniform animation API for a player regardless of whether it is driven by procedural clips, a GLB rig
+ * with AnimationMixer, or nothing at all (headless server). Game code only talks to this class.
+ * Every playAction is logged with an incrementing id so the network layer can replicate it.
  */
 export class PlayerAnimationController {
   constructor(model) {
     this.model = model;
     if (model.kind === 'gltf') this.backend = new MixerBackend(model.root, model.clips);
+    else if (model.kind === 'headless') this.backend = new HeadlessBackend();
     else this.backend = new ProceduralBackend(model.humanoid);
     this.locomotion = { speed: 0, sprinting: false, hasBall: false, isKeeper: !!model.isGoalkeeper };
+    this.actionId = 0;
+    this.lastAction = null; // { id, name, duration, params, t }
   }
 
   setLocomotion(patch) { Object.assign(this.locomotion, patch); this.backend.setLocomotion(this.locomotion); }
-  playAction(name, opts) { return this.backend.playAction(name, opts); }
+  playAction(name, opts = {}) {
+    const ok = this.backend.playAction(name, opts);
+    if (ok) this.lastAction = { id: ++this.actionId, name, duration: opts.duration || null, params: opts.params || null, t: opts.startAt || 0 };
+    return ok;
+  }
+  /** Replay support / network: the running action's elapsed time, or -1 when none. */
+  get actionTime() { const a = this.backend.currentAction; return a ? (a.t ?? (a.act ? a.act.time : 0)) : -1; }
   stopAction(fade) { this.backend.stopAction(fade); }
   isActionFinished() { return this.backend.isActionFinished(); }
   get currentActionName() { const a = this.backend.currentAction; return a ? a.name : null; }

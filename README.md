@@ -13,6 +13,43 @@ Open the URL Vite prints (default `http://localhost:5173`) in Chrome or Edge. Cl
 
 `npm run build` produces a static build in `dist/`; `npm run preview` serves it.
 
+## Online multiplayer
+
+Two people play against each other over the internet, each controlling one 7v7 team (one human plus AI
+teammates and an AI keeper they can take over). The Node server runs the whole match authoritatively:
+physics, AI, rules, restarts, replays timing and the shootout. Clients send compact intents, predict their
+own player's movement and interpolate everything else from 20 Hz snapshots.
+
+Run it locally (two terminals, or `npm run dev:all` for both at once):
+
+```bash
+npm run server
+```
+
+```bash
+npm run dev
+```
+
+Open `http://localhost:5173` in two browser windows, choose **Multiplayer** then **Find Match** in each;
+they are paired into a room, assigned BLUE/RED at random and count down together. `npm run test:server`
+runs an automated matchmaking / room / reconnect check against a throwaway server.
+
+Two devices: run the server on a machine both can reach and point the client at it with
+`VITE_GAME_SERVER_URL` (see `.env.example`), e.g. `ws://192.168.1.20:8787` on a LAN or `wss://your-host`
+once deployed behind TLS. Set `CLIENT_ORIGIN` on the server to your site's origin in production.
+
+**Hosting publicly (one service):** the Node server also serves the built client from `dist/` when it
+exists, and the client connects to the same origin automatically. Push the repo to GitHub and create a
+Render Web Service from it (`render.yaml` is included: build `npm install && npm run build`, start
+`npm run server`), or run `npm run build && npm run server` on any Node host with a public HTTPS URL.
+Then both players open the same URL and press Multiplayer → Find Match. Set `CLIENT_ORIGIN` to your site
+origin once it is live.
+
+Server files: `server/server.js` (WebSocket entry, sessions, reconnect tokens), `server/Matchmaker.js`
+(region queues, pairing), `server/GameRoom.js` (tick loop, snapshots, readiness, disconnect grace,
+rematch), `server/HeadlessMatch.js` (the simulation without rendering), `server/NetworkController.js`
+(validated client intents), `server/NetworkState.js` (snapshot encoding). Client side: `src/net/`.
+
 ## Controls
 
 | Input | Action |
@@ -24,6 +61,7 @@ Open the URL Vite prints (default `http://localhost:5173`) in Chrome or Edge. Cl
 | Right mouse (hold) | Charged low kick. 0-0.2s soft pass, 0.2-0.5s pass, 0.5-0.8s strong pass, 0.8-1.1s driven shot, 1.1s max |
 | E | Slide tackle (10s cooldown). Must physically reach the ball or the carrier |
 | Q | Juke / evade (10s cooldown). Evade window is the first 0.3s only |
+| C | Toggle shift lock: over-the-shoulder camera, the player faces the camera's forward, A/D strafe, S backpedals, kicks and tackles follow the aim. Works for the keeper too |
 | Tab | Cycle through your team, goalkeeper included (keeper AI pauses while you control them) |
 | Space | Switch to the teammate nearest the ball (when you don't have it); skips a replay |
 | R | Training mode only: reset the ball to your feet |
@@ -58,6 +96,29 @@ catching is refused.
 | Penalty | Right mouse (hold) placed shot, left mouse power shot; the taker runs up automatically |
 
 Goal kicks are taken by the keeper AI unless you Tab to the keeper first.
+
+## Touch controls (iPad, tablets, phones)
+
+Touch is detected by capability (`navigator.maxTouchPoints`, coarse-pointer / no-hover media queries)
+and the game switches between the desktop HUD and the touch layer from the most recent input device.
+Hold the device in landscape; portrait shows a rotate prompt without losing the match.
+
+- **Left thumb:** analogue joystick (small deflection walks, further runs) with a **SPRINT** button beside it.
+- **Right thumb:** drag the empty right half to look / aim; tap **PASS** (hold to charge, same power meter),
+  **SHOOT** (hard kick along the aim), **TACKLE** and **JUKE** (cooldowns shown on the buttons; the stick
+  picks the juke side), **SWITCH** (next teammate) and **LOCK** (shift lock).
+- **Goalkeeper:** the same buttons become **DIVE** (stick left/right picks the side, camera pitch picks
+  low/mid/high), **CATCH**, **RUSH** and **SHUFFLE**; with the ball in hand they become **KICK** and
+  **THROW** (hold for distance).
+- **Set pieces / penalties / shootout:** drag to aim, PASS/SHOOT deliver; contextual hints appear.
+- Top-right pause button, on-screen SKIP during replays, and a one-time controls tutorial.
+- Settings → Mobile Controls: touch camera sensitivity, joystick size, button size, control opacity,
+  left-handed layout, haptics. Touch-first devices start on the MEDIUM preset with a capped pixel ratio
+  and a lighter crowd; the game suggests a lower preset if the frame rate stays low.
+
+Every touch button feeds the same named action as its keyboard/mouse equivalent through
+`src/core/InputManager.js`, so single player, set pieces and online multiplayer behave identically and a
+touch player can face a desktop player.
 
 ## Rules
 

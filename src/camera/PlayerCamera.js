@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { clamp, damp, lerp, rand } from '../utils/MathUtils.js';
+import { SHIFT_LOCK } from '../utils/Constants.js';
 
 const DEFAULT_PITCH = 0.34;
 
@@ -35,6 +36,9 @@ export class PlayerCamera {
       setpiece: { distance: 9.5, height: 2.1, pitch: 0.4 }
     };
     this.rig = 'player';
+    this.shiftLock = null;   // ShiftLockController, set by the match
+    this.shoulder = 0;       // 0 = centred behind the player, 1 = over-the-shoulder framing
+    this.shoulderOffset = new THREE.Vector3();
   }
 
   /** Switch framing preset; distance/height ease in through the normal damping. */
@@ -95,11 +99,27 @@ export class PlayerCamera {
     this.smoothTarget.z = damp(this.smoothTarget.z, tz, 14, dt);
     this.smoothTarget.y = damp(this.smoothTarget.y, this.height, 8, dt);
 
+    // Aim vectors first: the shoulder offset below is built from the current yaw.
+    this.aimDir.set(Math.sin(this.yaw), 0, Math.cos(this.yaw));
+    this.forward.copy(this.aimDir);
+    this.right.set(-this.forward.z, 0, this.forward.x);
+
+    // Shift lock: over-the-shoulder framing, blended in/out over SHIFT_LOCK.TRANSITION seconds.
+    // Set-piece framing overrides it; the shift-lock state itself is untouched.
+    const slActive = !!(this.shiftLock && this.shiftLock.enabled) && this.rig !== 'setpiece';
+    this.shoulder = damp(this.shoulder, slActive ? 1 : 0, 3 / SHIFT_LOCK.TRANSITION, dt);
+    const keeper = this.rig === 'keeper';
+    const slDist = keeper ? SHIFT_LOCK.KEEPER_DISTANCE : SHIFT_LOCK.DISTANCE;
+    const slHeight = keeper ? SHIFT_LOCK.KEEPER_HEIGHT : SHIFT_LOCK.HEIGHT;
+    const slSide = keeper ? SHIFT_LOCK.KEEPER_SIDE_OFFSET : SHIFT_LOCK.SIDE_OFFSET;
+    this.smoothTarget.y = damp(this.smoothTarget.y, lerp(this.height, slHeight, this.shoulder), 8, dt);
+    this.shoulderOffset.copy(this.right).multiplyScalar(slSide * this.shoulder);
+
     const sprinting = p.sprintInput && p.speed > 6.5;
-    const wantDist = this.distance + (sprinting ? 1.1 : 0) + (p.hasBall ? -0.3 : 0);
+    const wantDist = lerp(this.distance, slDist, this.shoulder) + (sprinting ? 1.1 : 0) + (p.hasBall ? -0.3 : 0);
     this.currentDistance = damp(this.currentDistance, wantDist, 3, dt);
 
-    const ideal = this.computeIdealPosition(new THREE.Vector3(), this.currentDistance);
+    const ideal = this.computeIdealPosition(new THREE.Vector3(), this.currentDistance).add(this.shoulderOffset);
     // Lock the orbit rigidly (no lag on rotation) but smooth the distance/target motion
     this.smoothPos.x = damp(this.smoothPos.x, ideal.x, 30, dt);
     this.smoothPos.y = damp(this.smoothPos.y, ideal.y, 20, dt);
@@ -115,7 +135,7 @@ export class PlayerCamera {
 
     // Output pose (applied by the CameraDirector so rig changes can be blended)
     this.position.copy(this.smoothPos).add(this.shakeOffset);
-    this.lookAt.copy(this.smoothTarget);
+    this.lookAt.copy(this.smoothTarget).add(this.shoulderOffset);
     this.lookAt.y += 0.25;
     if (this.focusPoint) {
       // Set pieces: bias the look-at toward the ball so the target is framed while aiming.
@@ -125,10 +145,6 @@ export class PlayerCamera {
     const fov = this.fovBase + (sprinting ? 4 : 0);
     if (Math.abs(this.camera.fov - fov) > 0.05) { this.camera.fov = damp(this.camera.fov, fov, 4, dt); this.camera.updateProjectionMatrix(); }
 
-    // Aim: camera yaw projected on the ground
-    this.aimDir.set(Math.sin(this.yaw), 0, Math.cos(this.yaw));
-    this.forward.copy(this.aimDir);
-    this.right.set(this.forward.z, 0, -this.forward.x).negate(); // right-hand side of the camera
   }
 
   /** Convert an input axis (x right, z forward) into a world direction relative to the camera. */

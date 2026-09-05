@@ -37,6 +37,7 @@ export class Player {
     this.aimDir = new THREE.Vector3(0, 0, 1);
     this.aimPitch = 0;
     this.faceAim = false;
+    this.turnRate = PLAYER.TURN_RATE;   // controllers raise this under shift lock
 
     this.sm = new PlayerStateMachine(this);
     this.sm.onExpire = (s) => this.onStateExpired(s);
@@ -103,8 +104,13 @@ export class Player {
     this.updateActions(dt, world);
     this.sm.updateLocomotion(this.speed, this.sprintInput, this.hasBall);
 
-    // Animation
-    this.anim.setLocomotion({ speed: this.speed, sprinting: this.sprintInput, hasBall: this.hasBall, isKeeper: this.isGoalkeeper && !this.sm.is(S.CELEBRATING) });
+    // Animation: locomotion direction relative to facing so strafing/backpedalling can be shown.
+    let forwardFactor = 1, strafe = 0;
+    if (this.speed > 0.3) {
+      forwardFactor = (this.velocity.x * this.facingDir.x + this.velocity.z * this.facingDir.z) / this.speed;
+      strafe = (this.velocity.x * this.facingDir.z - this.velocity.z * this.facingDir.x) / this.speed; // +1 = moving to the player's left
+    }
+    this.anim.setLocomotion({ speed: this.speed, sprinting: this.sprintInput, hasBall: this.hasBall, isKeeper: this.isGoalkeeper && !this.sm.is(S.CELEBRATING), forwardFactor, strafe });
     this.anim.update(dt);
 
     // Sync visual
@@ -138,7 +144,7 @@ export class Player {
       const wantAim = this.faceAim || this.charging;
       if (wantAim) targetYaw = yawFromDir(this.aimDir.x, this.aimDir.z);
       else if (this.velocity.lengthSq() > 0.4) targetYaw = yawFromDir(this.velocity.x, this.velocity.z);
-      this.facing = dampAngle(this.facing, targetYaw, PLAYER.TURN_RATE, dt);
+      this.facing = dampAngle(this.facing, targetYaw, this.turnRate || PLAYER.TURN_RATE, dt);
     } else if (st === S.TACKLING) {
       const t = this.sm.stateTime / TACKLE.DURATION;
       const sp = TACKLE.LUNGE_SPEED * Math.pow(1 - clamp(t, 0, 1), 1.15);
@@ -204,9 +210,11 @@ export class Player {
   }
 
   /** Slide tackle: E. Skill-based - it only does something if the slide capsule actually reaches the ball or its owner. */
-  requestTackle(world) {
+  requestTackle(world, dirOverride = null) {
     if (!this.sm.canTackle() || this.tackleCooldown > 0 || this.charging) return false;
-    const dir = this.moveInput.lengthSq() > 0.01 ? tmpA.copy(this.moveInput).normalize() : tmpA.copy(this.facingDir);
+    // Shift lock passes the camera-forward direction so tackles can be aimed precisely.
+    const dir = dirOverride && dirOverride.lengthSq() > 0.01 ? tmpA.copy(dirOverride).setY(0).normalize()
+      : this.moveInput.lengthSq() > 0.01 ? tmpA.copy(this.moveInput).normalize() : tmpA.copy(this.facingDir);
     this.tackle = { dir: dir.clone(), hit: false, evaded: false, resolved: false };
     this.facing = yawFromDir(dir.x, dir.z);
     this.tackleCooldown = TACKLE.COOLDOWN;
@@ -220,7 +228,7 @@ export class Player {
 
   updateTackle(dt, world) {
     const t = this.sm.stateTime;
-    if (this.tackle.resolved || t < TACKLE.ACTIVE_START || t > TACKLE.ACTIVE_END) return;
+    if (world.replica || this.tackle.resolved || t < TACKLE.ACTIVE_START || t > TACKLE.ACTIVE_END) return;
     const ball = world.ball;
     // Capsule from the player's feet forward along the slide direction
     const a = tmpA.copy(this.position); a.y = 0.25;
@@ -308,7 +316,7 @@ export class Player {
   }
 
   /** Juke: Q. Side +1 = left, -1 = right. Evade window only covers the first JUKE.EVADE_WINDOW seconds. */
-  requestJuke(world, sideHint = 0) {
+  requestJuke(world, sideHint = 0, styleHint = -1) {
     if (!this.sm.canJuke() || this.jukeCooldown > 0) return false;
     let side = sideHint;
     if (!side) {
@@ -317,7 +325,7 @@ export class Player {
       const lat = this.moveInput.dot(left);
       side = Math.abs(lat) > 0.3 ? Math.sign(lat) : (Math.random() < 0.5 ? 1 : -1);
     }
-    this.juke = { side, baseSpeed: Math.min(this.speed, PLAYER.RUN_SPEED), style: randInt(0, 2) };
+    this.juke = { side, baseSpeed: Math.min(this.speed, PLAYER.RUN_SPEED), style: styleHint >= 0 ? styleHint : randInt(0, 2) };
     this.jukeCooldown = JUKE.COOLDOWN;
     this.evadeActive = true;
     this.evadeTimer = JUKE.EVADE_WINDOW;
@@ -381,6 +389,7 @@ export class Player {
   executeKick(world) {
     const k = this.pendingKick;
     const ball = world.ball;
+    if (world.replica) return; // online client: the kick animation is predicted, the ball is the server's
     if (!this.ballInKickRange(ball) && !(this.hasBall && ball.position.distanceTo(this.position) < KICK.REACH * 1.3)) {
       world.events.emit('kick_whiff', { player: this });
       return;
@@ -619,6 +628,7 @@ export class Player {
     const r = this.pendingRelease;
     this.pendingRelease = null;
     const ball = world.ball;
+    if (world.replica) { this.holdMode = 'keeper'; return; }
     if (ball.owner !== this) return;
     this.getHeldBallPosition(tmpC);
     ball.position.copy(tmpC);

@@ -9,7 +9,7 @@ import { ASSET_MANIFEST } from '../assets/AssetManifest.js';
  *   root, setColors(), setNumber(), setName(), showName(), kind ('gltf' | 'procedural')
  */
 export class PlayerModel {
-  constructor({ assets, goalkeeper = false, shirtColor, shortsColor, socksColor, skinTone, hairColor, hairStyle, number = 0, name = '' }) {
+  constructor({ assets, goalkeeper = false, shirtColor, shortsColor, socksColor, skinTone, hairColor, hairStyle, number = 0, name = '', headless = false }) {
     this.isGoalkeeper = goalkeeper;
     this.root = new THREE.Group();
     this.root.name = 'PlayerModel';
@@ -19,6 +19,14 @@ export class PlayerModel {
     this.humanoid = null;
     this.clips = null;
     this.materialsByRole = {};
+
+    if (headless) {
+      // Server-side: no geometry, no canvases, no DOM. Just a transform the simulation can move.
+      this.kind = 'headless';
+      this.height = 1.8;
+      this.nameTag = { visible: false };
+      return;
+    }
 
     const gltf = assets && (goalkeeper ? (assets.getModel('goalkeeper') || assets.getModel('player')) : assets.getModel('player'));
     if (gltf) this.buildFromGLTF(gltf, assets);
@@ -77,6 +85,7 @@ export class PlayerModel {
 
   setColors({ shirt, shorts, socks, skin, hair, boots } = {}) {
     Object.assign(this.colors, { shirt, shorts, socks, skin, hair });
+    if (this.kind === 'headless') return;
     if (this.kind === 'procedural') { this.humanoid.setColors({ shirt, shorts, socks, skin, hair, boots }); return; }
     const apply = (role, hex) => { if (hex === undefined) return; for (const m of this.materialsByRole[role] || []) { if (m.color) m.color.setHex(hex); } };
     apply('shirt', shirt); apply('shorts', shorts); apply('socks', socks); apply('skin', skin); apply('hair', hair); apply('boots', boots);
@@ -84,6 +93,7 @@ export class PlayerModel {
 
   setNumber(n) {
     this.number = n;
+    if (this.kind === 'headless') return;
     if (this.kind === 'procedural') this.humanoid.setNumber(n);
     this.updateNameTag();
   }
@@ -104,6 +114,7 @@ export class PlayerModel {
   }
 
   updateNameTag() {
+    if (this.kind === 'headless') return;
     const g = this.tagCanvas.getContext('2d');
     g.clearRect(0, 0, 256, 64);
     const text = `${this.number ? this.number + '  ' : ''}${this.name || ''}`.trim();
@@ -120,6 +131,7 @@ export class PlayerModel {
 
   /** Marker ring under the controlled player. */
   setMarker(color) {
+    if (this.kind === 'headless') return;
     if (!this.marker) {
       const geo = new THREE.RingGeometry(0.45, 0.6, 32);
       const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85, depthWrite: false });
@@ -133,6 +145,7 @@ export class PlayerModel {
   }
 
   getFootWorldPosition(side, out) {
+    if (this.kind === 'headless') return this.root.getWorldPosition(out);
     if (this.kind === 'procedural') return this.humanoid.getFootWorldPosition(side, out);
     const names = side === 'r' ? ASSET_MANIFEST.rig.rightFoot : ASSET_MANIFEST.rig.leftFoot;
     for (const n of names) { const b = this.gltfScene.getObjectByName(n); if (b) return b.getWorldPosition(out); }
@@ -140,6 +153,7 @@ export class PlayerModel {
   }
 
   dispose() {
+    if (this.kind === 'headless') { if (this.root.parent) this.root.parent.remove(this.root); return; }
     if (this.humanoid) this.humanoid.dispose();
     if (this.gltfScene) this.gltfScene.traverse((o) => { if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach((m) => m.dispose()); });
     this.tagTexture.dispose(); this.nameTag.material.dispose();

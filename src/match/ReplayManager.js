@@ -104,7 +104,12 @@ export class ReplayManager {
     this.playing = { kind, plan, segment: 0, t: plan[0].from, context, end };
     this.onComplete = onComplete || null;
     this.camera.setShot(plan[0].shot, context, this.ballAt(plan[0].from));
-    this.match.events.emit('replay_start', { kind });
+    // Real-time length of the plan (used by the multiplayer server to hold both clients in the replay).
+    const duration = plan.reduce((sum, seg) => sum + (seg.to - seg.from) / seg.speed, 0);
+    this.match.events.emit('replay_start', {
+      kind, eventTime, goalSide: context.goalSide, duration,
+      shot: shot ? { time: shot.time, player: shot.player, position: shot.position, velocity: shot.velocity, team: shot.team } : null
+    });
     return true;
   }
 

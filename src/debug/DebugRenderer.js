@@ -105,7 +105,14 @@ export class DebugRenderer {
     const lines = [];
     lines.push(`MATCH ${match.state}  clock ${match.clock.toFixed(1)}  score ${match.score[0]}-${match.score[1]}`);
     lines.push(`BALL ${ball.state} spd ${ball.speed.toFixed(1)} y ${ball.position.y.toFixed(2)} owner ${ball.owner ? ball.owner.name : '-'}`);
-    lines.push(`phase B:${match.teamManager.teamAIs[0].phase} R:${match.teamManager.teamAIs[1].phase}`);
+    if (match.online) {
+      const n = match.net;
+      lines.push(`NET room ${match.descriptor.roomId} me ${n.identity ? n.identity.playerId : '-'} team ${match.localTeam}`);
+      lines.push(`NET ping ${n.ping}ms tick ${match.stats.serverTick} snaps/s ${n.stats.snapshotRate} pkts ${n.stats.received} ack ${match.lastAck} buf ${match.buffer.length}`);
+      lines.push(`NET controlled ${match.human ? match.human.name : '-'} predicting ${match.isPredicting()} corr ${match.correction.length().toFixed(2)}`);
+    } else {
+      lines.push(`phase B:${match.teamManager.teamAIs[0].phase} R:${match.teamManager.teamAIs[1].phase}`);
+    }
     lines.push('');
     for (const p of match.players) {
       const a = p.ai && p.ai.teamAI ? p.ai.teamAI.getAssignment(p) : null;

@@ -33,6 +33,15 @@ export class Ball {
 
     this.group = new THREE.Group();
     this.group.name = 'Ball';
+    if (assets === 'headless') {
+      // Server-side: transform holders only (the mesh quaternion is still tracked for replication).
+      this.headless = true;
+      this.mesh = new THREE.Object3D();
+      this.group.add(this.mesh);
+      this.shadow = new THREE.Object3D();
+      this.shadow.material = { opacity: 0 };
+      return;
+    }
     const gltf = assets && assets.getModel('ball');
     if (gltf) {
       const s = gltf.scene.clone();

@@ -12,6 +12,7 @@ import { BallPhysics } from '../ball/BallPhysics.js';
 import { PossessionSystem } from '../ball/PossessionSystem.js';
 import { PlayerCamera } from '../camera/PlayerCamera.js';
 import { CameraDirector } from '../camera/CameraDirector.js';
+import { ShiftLockController } from '../camera/ShiftLockController.js';
 import { PlayerController } from '../player/PlayerController.js';
 import { GoalkeeperController } from '../player/GoalkeeperController.js';
 import { GoalkeeperSkills } from '../player/GoalkeeperSkills.js';
@@ -28,9 +29,15 @@ const SET_PIECE_STATES = new Set([MATCH_STATE.FREE_KICK, MATCH_STATE.PENALTY, MA
  * Runs one match. Owns the squads, ball, physics and the per-frame simulation order, and drives the
  * match state machine. Rules, restarts, replays, switching and the shootout live in their own managers;
  * this class only sequences them.
+ *
+ * Human control is organised in "slots", one per human team (single player: BLUE only; online: both).
+ * Each slot has its own controllers and PlayerSwitchManager. `localTeam` marks the slot that owns the
+ * camera/HUD on this machine (null on the headless multiplayer server, where every slot is driven by
+ * network intents through `controllerFactory`).
  */
 export class MatchManager {
-  constructor({ sceneManager, assets, settings, audio, events, input, arena, mode = 'match' }) {
+  constructor({ sceneManager, assets, settings, audio, events, input, arena, mode = 'match', initialShiftLock = false,
+    humanTeams = [TEAM.BLUE], localTeam = TEAM.BLUE, headless = false, roster = null, humanNames = null, difficulty = null, controllerFactory = null, duration = null }) {
     this.sceneManager = sceneManager;
     this.scene = sceneManager.scene;
     this.assets = assets;
@@ -41,11 +48,19 @@ export class MatchManager {
     this.arena = arena;
     this.mode = mode;
     this.training = mode === 'training';
+    this.initialShiftLock = initialShiftLock;
+    this.humanTeams = humanTeams;
+    this.localTeam = localTeam;
+    this.headless = headless;
+    this.rosterIn = roster;
+    this.humanNames = humanNames;
+    this.difficultyName = difficulty;
+    this.controllerFactory = controllerFactory;
 
     this.state = MATCH_STATE.KICKOFF;
     this.stateTimer = 0;
     this.clock = 0;
-    this.duration = this.training ? Infinity : (settings.get('matchDuration') || MATCH.DURATION);
+    this.duration = this.training ? Infinity : (duration || (settings ? settings.get('matchDuration') : null) || MATCH.DURATION);
     this.score = [0, 0];
     this.time = 0;
     this.excitement = 0;
@@ -59,16 +74,22 @@ export class MatchManager {
     this.pendingRestart = null;
     this.result = null;
     this.debugNames = false;
+    this.humans = {};
+    this.slots = {};
   }
 
   start() {
-    this.teamManager = new TeamManager({ assets: this.assets, scene: this.scene, settings: this.settings, training: this.training }).build();
+    this.teamManager = new TeamManager({
+      assets: this.headless ? null : this.assets, scene: this.scene, settings: this.settings, training: this.training,
+      humanTeams: this.humanTeams, localTeam: this.localTeam, headless: this.headless, roster: this.rosterIn, humanNames: this.humanNames, difficulty: this.difficultyName
+    }).build();
     this.players = this.teamManager.players;
-    this.human = this.teamManager.human;
+    this.humans = { ...this.teamManager.humans };
     this.formation = this.teamManager.formation;
+    this.roster = this.teamManager.roster;
 
-    this.ball = new Ball(this.assets);
-    this.scene.add(this.ball.group);
+    this.ball = new Ball(this.headless ? 'headless' : this.assets);
+    if (this.scene) this.scene.add(this.ball.group);
     this.physics = new BallPhysics(this.arena.goals);
     this.physics.onBounce = (ball, impact) => this.audio.play('bounce', { volume: clamp(impact / 12, 0.1, 0.6), pitch: this.audio.randomPitch(0.15) });
     this.physics.onPost = (ball, speed, name, goal) => this.onPost(speed, name, goal);
@@ -81,15 +102,14 @@ export class MatchManager {
     this.possession = new PossessionSystem();
     this.goalSystem = new GoalSystem(this.arena.goals, this.events);
 
-    // Cameras
-    this.camera = new PlayerCamera(this.sceneManager.camera, this.settings);
+    // Cameras (harmless but unused on the server)
+    this.camera = new PlayerCamera(this.sceneManager.camera, this.settings || { get: () => 1 });
     this.cameraDirector = new CameraDirector(this.sceneManager.camera);
     this.cameraDirector.register('gameplay', this.camera);
 
-    // Controllers
-    this.controller = new PlayerController(this.input, this.camera);
-    this.gkController = new GoalkeeperController(this.input, this.camera);
-    this.activeController = this.controller;
+    // Shift lock (C): owned here so it survives switching, set pieces and replays.
+    this.shiftLock = new ShiftLockController(this.camera, this.events, this.initialShiftLock);
+    this.camera.shiftLock = this.shiftLock;
 
     // Managers
     this.rules = new RulesManager(this);
@@ -97,7 +117,6 @@ export class MatchManager {
     this.setPieces = new SetPieceManager(this);
     this.replays = new ReplayManager(this);
     this.cameraDirector.register('replay', this.replays.camera);
-    this.switcher = new PlayerSwitchManager(this);
     this.shootout = new PenaltyShootoutManager(this);
 
     this.world = {
@@ -106,37 +125,62 @@ export class MatchManager {
     };
     for (const p of this.players) if (p.ai && p.ai.setWorld) p.ai.setWorld(this.world);
 
-    const wire = (ctrl) => {
-      ctrl.onSwitchRequest = () => this.switcher.nearestToBall();
-      ctrl.onCycleRequest = () => { this.switcher.cycle(1); this.setPieces.applyControllerMode(); };
-      ctrl.onToast = (t) => this.events.emit('toast', { text: t });
-    };
-    wire(this.controller); wire(this.gkController);
-    this.controller.setPieces = this.setPieces;
-    this.useController(this.controller, this.human);
+    // Control slots: one per human team.
+    for (const team of this.humanTeams) {
+      const slot = { team, human: this.humans[team], switcher: new PlayerSwitchManager(this, team) };
+      if (this.controllerFactory) {
+        const made = this.controllerFactory(team, this);
+        slot.controller = made.controller; slot.gkController = made.gkController;
+      } else {
+        slot.controller = new PlayerController(this.input, this.camera);
+        slot.gkController = new GoalkeeperController(this.input, this.camera);
+      }
+      for (const ctrl of [slot.controller, slot.gkController]) {
+        ctrl.onSwitchRequest = () => slot.switcher.nearestToBall();
+        ctrl.onCycleRequest = () => { slot.switcher.cycle(1); this.setPieces.applyControllerMode(); };
+        ctrl.onToast = (t) => { if (team === this.localTeam) this.events.emit('toast', { text: t }); };
+        ctrl.shiftLock = team === this.localTeam ? this.shiftLock : null;
+        ctrl.setPieces = this.setPieces;
+      }
+      slot.activeController = slot.controller;
+      this.slots[team] = slot;
+      this.useController(team, slot.human);
+    }
 
     this.subs.push(this.events.on('goal', (d) => this.onGoal(d)));
     this.subs.push(this.events.on('kick', (d) => this.onKick(d)));
     this.subs.push(this.events.on('save', (d) => { this.lastSave = { time: this.time, data: d }; }));
-    this.subs.push(this.events.on('tackle_hit', (d) => { if (d.player.isHuman || d.victim.isHuman) this.camera.addShake(0.35); }));
+    this.subs.push(this.events.on('tackle_hit', (d) => { if (d.player === this.human || d.victim === this.human) this.camera.addShake(0.35); }));
 
     this.setupKickoff(TEAM.BLUE, true);
     this.audio.startAmbience('crowd', 0.3);
     return this;
   }
 
-  /* ------------------------------------------------------------ helpers used by managers */
+  /* ------------------------------------------------------------ slots / helpers used by managers */
 
+  /** The human this machine controls (camera/HUD). On the server: the BLUE human as a stand-in. */
+  get human() { return this.humans[this.localTeam ?? TEAM.BLUE] || this.humans[TEAM.RED] || this.players[0]; }
+  get localSlot() { return this.slots[this.localTeam ?? TEAM.BLUE] || this.slotList()[0]; }
+  get controller() { return this.localSlot.controller; }
+  get gkController() { return this.localSlot.gkController; }
+  get switcher() { return this.localSlot.switcher; }
+  get activeController() { return this.localSlot.activeController; }
+  slotList() { return Object.values(this.slots); }
+  setHuman(team, p) { this.humans[team] = p; if (this.slots[team]) this.slots[team].human = p; this.teamManager.humans[team] = p; if (team === this.localTeam) this.teamManager.human = p; }
   isOpenPlay() { return this.state === MATCH_STATE.PLAYING; }
   makeOutfieldAI(p) { return new AIPlayer(p, this.teamManager.teamAIs[p.team], this.teamManager.difficulty); }
 
-  useController(ctrl, player) {
-    if (this.activeController && this.activeController !== ctrl) this.activeController.setPlayer(null);
-    this.activeController = ctrl;
+  useController(team, player) {
+    const slot = this.slots[team];
+    if (!slot || !player) return;
+    const ctrl = player.isGoalkeeper ? slot.gkController : slot.controller;
+    if (slot.activeController && slot.activeController !== ctrl) slot.activeController.setPlayer(null);
+    slot.activeController = ctrl;
     ctrl.setPlayer(player);
   }
 
-  enterState(state, timer = 0) { this.state = state; this.stateTimer = timer; }
+  enterState(state, timer = 0) { this.state = state; this.stateTimer = timer; this.events.emit('match_state', { state, timer }); }
 
   /* ------------------------------------------------------------ flow: kickoff / play */
 
@@ -158,23 +202,22 @@ export class MatchManager {
       p.targetPosition.copy(tmp);
       if (p.ai) { if (p.ai.moveTarget) p.ai.moveTarget.copy(tmp); p.ai.threat = null; p.ai.mode = 'POSITION'; }
     }
-    // Human back on an outfield player for kick-off framing (keeper control is kept if chosen).
     this.camera.setRig(this.human.isGoalkeeper ? 'keeper' : 'player');
     this.camera.setTarget(this.human, true);
     this.cameraDirector.setActive('gameplay', first ? 0 : 0.8);
-    this.controller.mode = 'normal'; this.gkController.mode = 'normal';
+    for (const slot of this.slotList()) { slot.controller.mode = 'normal'; slot.gkController.mode = 'normal'; }
     this.events.emit('kickoff_setup', { team: kickingTeam, first });
   }
 
   beginPlay() {
-    this.state = MATCH_STATE.PLAYING;
+    this.enterState(MATCH_STATE.PLAYING);
     this.frozen = false;
     this.audio.play('whistle', { volume: 0.7 });
     this.events.emit('kickoff', { team: this.kickoffTeam });
   }
 
   resumePlay() {
-    this.state = MATCH_STATE.PLAYING;
+    this.enterState(MATCH_STATE.PLAYING);
     this.frozen = false;
     this.possession.locked = false;
     this.ball.frozen = false;
@@ -214,16 +257,18 @@ export class MatchManager {
       kind: 'goal', eventTime: g.eventTime, shot: g.shot, goalSide: g.goalSide,
       onComplete: () => this.showGoalUI()
     });
-    if (started) { this.cameraDirector.setActive('replay', 0.5); this.switcher.locked = true; }
+    if (started) { this.cameraDirector.setActive('replay', 0.5); this.lockSwitching(true); }
     else this.showGoalUI();
   }
 
   showGoalUI() {
-    this.switcher.locked = false;
+    this.lockSwitching(false);
     this.cameraDirector.setActive('gameplay', 0.6);
     this.enterState(MATCH_STATE.GOAL_UI, 2.2);
     this.events.emit('goal_ui', { ...this.lastGoal, score: [...this.score] });
   }
+
+  lockSwitching(v) { for (const slot of this.slotList()) slot.switcher.locked = v; }
 
   /* ------------------------------------------------------------ flow: out of play / fouls */
 
@@ -243,7 +288,6 @@ export class MatchManager {
     this.audio.play('whistle', { volume: 0.4 });
     this.events.emit('ball_out', d);
 
-    // Replays: a significant save that ran out for a corner, or a near-miss / post hit that went out.
     const goalSide = Math.sign(d.exitPoint.z) || 1;
     const shot = this.replays.recentShot(4, goalSide);
     const recentSave = this.lastSave && this.time - this.lastSave.time < 3.5 ? this.lastSave.data : null;
@@ -254,7 +298,7 @@ export class MatchManager {
     if (kind) {
       this.enterState(kind === 'save' ? MATCH_STATE.SAVE_REPLAY : MATCH_STATE.MISSED_SHOT_REPLAY);
       const started = this.replays.play({ kind, eventTime: kind === 'save' ? this.lastSave.time : this.time, shot, goalSide, onComplete: () => this.beginPendingRestart() });
-      if (started) { this.cameraDirector.setActive('replay', 0.5); this.switcher.locked = true; return; }
+      if (started) { this.cameraDirector.setActive('replay', 0.5); this.lockSwitching(true); return; }
     }
     this.beginPendingRestart(0.9);
   }
@@ -273,7 +317,7 @@ export class MatchManager {
   }
 
   beginPendingRestart(delay = 0) {
-    this.switcher.locked = false;
+    this.lockSwitching(false);
     const spec = this.pendingRestart;
     if (!spec) { this.resumePlay(); return; }
     if (delay > 0) { this.enterState(MATCH_STATE.FOUL_STOPPAGE, delay); this.stoppageIsOut = true; return; }
@@ -292,12 +336,11 @@ export class MatchManager {
     teamAI.players = teamAI.players.filter((p) => p !== player);
     this.teamManager.teams[player.team] = this.teamManager.teams[player.team].filter((p) => p !== player);
     if (this.ball.owner === player) this.possession.release(this.ball);
-    // Walk off: park the model in the tunnel and hide it.
     player.teleport(-(PITCH.HALF_WIDTH + 6), 0, 0);
     player.model.root.visible = false;
-    if (player.isHuman) {
+    if (player.isHuman && this.slots[player.team]) {
       const next = this.players.find((p) => p.team === player.team && !p.isGoalkeeper) || this.players.find((p) => p.team === player.team);
-      if (next) this.switcher.switchTo(next, { reason: 'sendoff' });
+      if (next) this.slots[player.team].switcher.switchTo(next, { reason: 'sendoff' });
     }
     this.events.emit('send_off', { player });
   }
@@ -305,7 +348,7 @@ export class MatchManager {
   onKick(d) {
     this.replays.noteKick(d);
     if (this.setPieces.isActive()) this.setPieces.onTakerKick(d);
-    if (!this.shootout.active) this.switcher.onKick(d);
+    if (!this.shootout.active) for (const slot of this.slotList()) slot.switcher.onKick(d);
   }
 
   /* ------------------------------------------------------------ flow: full time */
@@ -324,12 +367,12 @@ export class MatchManager {
 
   finishMatch(result) {
     this.setPieces.cancel();
-    this.state = MATCH_STATE.MATCH_FINISHED;
+    this.enterState(MATCH_STATE.MATCH_FINISHED);
     this.frozen = true;
     this.result = { ...result, score: [...this.score] };
     if (!result.shootout) this.audio.play('whistle_long', { volume: 0.8 });
     for (const p of this.players) p.setMoveInput(0, 0, false);
-    this.events.emit('fulltime', { score: [...this.score], human: this.human, players: this.players, winner: result.winner, shootout: result.shootout || null });
+    this.events.emit('fulltime', { score: [...this.score], human: this.human, players: this.players, winner: result.winner, shootout: result.shootout || null, reason: result.reason || null });
   }
 
   /* ------------------------------------------------------------ per-frame */
@@ -389,22 +432,23 @@ export class MatchManager {
     const shootoutLive = this.state === MATCH_STATE.PENALTY_SHOOTOUT;
     const interactive = playing || setPiece || shootoutLive;
 
-    // Training helper
-    if (this.training && playing && this.input.wasPressed('KeyR')) {
-      this.possession.release(this.ball);
-      this.ball.reset(this.human.position.x + this.human.facingDir.x * 1.5, this.human.position.z + this.human.facingDir.z * 1.5);
+    // Local-only keys: C toggles shift lock, R resets the training ball.
+    if (this.input) {
+      if (this.input.pressed('SHIFT_LOCK')) this.shiftLock.toggle();
+      if (this.training && playing && this.input.pressed('RESET_BALL')) {
+        this.possession.release(this.ball);
+        this.ball.reset(this.human.position.x + this.human.facingDir.x * 1.5, this.human.position.z + this.human.facingDir.z * 1.5);
+      }
     }
 
     // Intents
     if (interactive) {
-      this.activeController.enabled = true;
-      this.activeController.update(dt, this.world);
+      for (const slot of this.slotList()) { slot.activeController.enabled = true; slot.activeController.update(dt, this.world); }
       if (playing) for (const ai of this.teamManager.teamAIs) ai.update(dt, this.world);
       for (const p of this.players) if (p.ai && !p.isHuman) p.ai.update(dt, this.world);
       if (setPiece) this.setPieces.update(0); // re-apply set-piece driving after controllers/AI
     } else {
-      const md = this.input.consumeMouseDelta();
-      this.camera.applyMouse(md.x, md.y);
+      if (this.input) { const md = this.input.consumeMouseDelta(); this.camera.applyMouse(md.x, md.y); }
       for (const p of this.players) p.setMoveInput(0, 0, false);
     }
 
@@ -487,7 +531,7 @@ export class MatchManager {
     for (const off of this.subs) off();
     this.shootout.active = false;
     this.teamManager.dispose();
-    this.scene.remove(this.ball.group);
+    if (this.scene) this.scene.remove(this.ball.group);
     this.audio.stopAmbience('crowd');
   }
 }

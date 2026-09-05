@@ -33,6 +33,7 @@ export const GoalkeeperSkills = {
   /** Take the ball into the hands. Returns false (and does nothing) when hands are not allowed. */
   catchBall(world, keeper, { wasDive = false, pickup = false } = {}) {
     const ball = world.ball;
+    if (world.replica) return false; // online client: the server decides catches
     if (!this.canUseHands(keeper, ball)) return false;
     // A shot counts as saved whether it is caught in flight or trapped at the feet first and then picked up.
     const wasShot = (ball.lastTouchType === 'SHOT' && ball.lastTouchTeam !== keeper.team && ball.speed > 7) ||
@@ -52,6 +53,7 @@ export const GoalkeeperSkills = {
 
   /** Push the ball away with the hands (inside the box) or the body (outside). */
   parry(world, keeper, { body = false } = {}) {
+    if (world.replica) return;
     const ball = world.ball;
     const spd = ball.speed;
     const fwd = this.forward(keeper);

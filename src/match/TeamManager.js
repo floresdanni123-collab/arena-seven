@@ -14,67 +14,102 @@ const HAIR = [0x2a1a10, 0x111111, 0x6b3b1a, 0xd9b26f, 0x3a2a20];
 
 /**
  * Builds both squads (7 each) with kits, names, numbers, AI brains and team coordinators.
+ *
+ * Options:
+ *   humanTeams  - which teams have a human slot (default [BLUE]; online matches use [BLUE, RED])
+ *   localTeam   - which human is "ours" for camera/HUD purposes (null on the server)
+ *   headless    - server mode: no models, no DOM
+ *   roster      - a roster produced by another TeamManager (the server's) so clients build identical squads
+ *   humanNames  - display names for human slots keyed by team
  */
 export class TeamManager {
-  constructor({ assets, scene, settings, formation = '2-3-1', training = false }) {
+  constructor({ assets, scene, settings, formation = '2-3-1', training = false, humanTeams = [TEAM.BLUE], localTeam = TEAM.BLUE, headless = false, roster = null, humanNames = null, difficulty = null }) {
     this.assets = assets;
     this.scene = scene;
     this.settings = settings;
     this.training = training;
+    this.headless = headless;
+    this.humanTeams = humanTeams;
+    this.localTeam = localTeam;
+    this.humanNames = humanNames || {};
     this.formationName = formation;
     this.formation = new FormationSystem(formation);
     this.players = [];
+    this.allPlayers = [];
     this.teams = [[], []];
     this.teamAIs = [];
+    this.humans = {};
     this.human = null;
-    this.difficulty = AI_DIFFICULTY[settings.get('difficulty')] || AI_DIFFICULTY.NORMAL;
+    this.roster = roster;
+    const diffName = difficulty || (settings ? settings.get('difficulty') : 'NORMAL');
+    this.difficulty = AI_DIFFICULTY[diffName] || AI_DIFFICULTY.NORMAL;
   }
 
-  build() {
-    const profile = this.settings.profile;
+  /** Produce the squad description (deterministic input for clients when sent by the server). */
+  generateRoster() {
+    const profile = this.settings ? this.settings.profile : null;
+    const useProfile = !!profile && this.humanTeams.length === 1;
     const kits = [
-      { shirt: profile.shirtColor ?? COLORS.BLUE_SHIRT, shorts: profile.shortsColor ?? COLORS.BLUE_SHORTS, socks: profile.shirtColor ?? COLORS.SOCKS_BLUE, gk: COLORS.BLUE_GK },
+      { shirt: useProfile ? profile.shirtColor : COLORS.BLUE_SHIRT, shorts: useProfile ? profile.shortsColor : COLORS.BLUE_SHORTS, socks: useProfile ? profile.shirtColor : COLORS.SOCKS_BLUE, gk: COLORS.BLUE_GK },
       { shirt: COLORS.RED_SHIRT, shorts: COLORS.RED_SHORTS, socks: COLORS.SOCKS_RED, gk: COLORS.RED_GK }
     ];
-    // Avoid identical kits if the player picked red for their team.
     if (Math.abs(kits[0].shirt - kits[1].shirt) < 0x101010) { kits[1].shirt = 0xffffff; kits[1].shorts = 0x1b1b24; kits[1].socks = 0xffffff; }
-
     const usedNames = new Set();
-    let id = 0;
+    const roster = [];
     for (const team of [TEAM.BLUE, TEAM.RED]) {
-      const teamAI = new TeamAI(team, this.formation, this.difficulty);
-      this.teamAIs[team] = teamAI;
       const kit = kits[team];
       this.formation.slots.forEach((slot, slotIndex) => {
         const isGK = slot.role === ROLE.GOALKEEPER;
-        const isHuman = team === TEAM.BLUE && slot.role === ROLE.ATTACKER;
-        // Training mode: the opposition fields only a goalkeeper.
+        const isHuman = this.humanTeams.includes(team) && slot.role === ROLE.ATTACKER;
         if (this.training && team === TEAM.RED && !isGK) return;
         let name;
         do { name = `${pick(FIRST)} ${pick(LAST)}`; } while (usedNames.has(name));
         usedNames.add(name);
-        const number = isGK ? 1 : (isHuman ? profile.shirtNumber : 2 + slotIndex + (team === TEAM.RED ? 7 : 0));
-        const skin = isHuman ? profile.skinTone : pick(SKIN);
-        const hair = isHuman ? profile.hairColor : pick(HAIR);
-        const hairStyle = isHuman ? profile.hairStyle : Math.floor(Math.random() * 4);
-        const model = new PlayerModel({
-          assets: this.assets, goalkeeper: isGK,
-          shirtColor: isGK ? kit.gk : kit.shirt, shortsColor: isGK ? 0x111111 : kit.shorts, socksColor: kit.socks,
-          skinTone: skin, hairColor: hair, hairStyle, number, name: isHuman ? (profile.playerName || 'YOU') : name.split(' ')[1].toUpperCase()
+        const humanName = this.humanNames[team] || (useProfile && profile ? (profile.playerName || 'YOU') : 'YOU');
+        roster.push({
+          team, slotIndex, role: slot.role, isGK, isHuman,
+          name: isHuman ? humanName : name,
+          number: isGK ? 1 : (isHuman && useProfile ? profile.shirtNumber : (isHuman ? 10 : 2 + slotIndex + (team === TEAM.RED ? 7 : 0))),
+          shirt: isGK ? kit.gk : kit.shirt, shorts: isGK ? 0x111111 : kit.shorts, socks: kit.socks,
+          skin: isHuman && useProfile ? profile.skinTone : pick(SKIN),
+          hair: isHuman && useProfile ? profile.hairColor : pick(HAIR),
+          hairStyle: isHuman && useProfile ? profile.hairStyle : Math.floor(Math.random() * 4)
         });
-        const player = new Player({ id: id++, team, role: slot.role, name: isHuman ? (profile.playerName || 'YOU') : name, number, model, isHuman, difficulty: this.difficulty });
-        player.slotIndex = slotIndex;
-        this.scene.add(model.root);
-        if (isHuman) { this.human = player; model.showName(true); model.setMarker(0xb8ff3b); }
-        else if (isGK) player.ai = new GoalkeeperAI(player, teamAI, this.difficulty);
-        else player.ai = new AIPlayer(player, teamAI, this.difficulty);
+      });
+    }
+    return roster;
+  }
+
+  build() {
+    if (!this.roster) this.roster = this.generateRoster();
+    let id = 0;
+    for (const team of [TEAM.BLUE, TEAM.RED]) {
+      const teamAI = new TeamAI(team, this.formation, this.difficulty);
+      this.teamAIs[team] = teamAI;
+      for (const r of this.roster.filter((x) => x.team === team)) {
+        const model = new PlayerModel({
+          assets: this.assets, goalkeeper: r.isGK, headless: this.headless,
+          shirtColor: r.shirt, shortsColor: r.shorts, socksColor: r.socks,
+          skinTone: r.skin, hairColor: r.hair, hairStyle: r.hairStyle, number: r.number,
+          name: r.isHuman ? r.name : r.name.split(' ')[1].toUpperCase()
+        });
+        const player = new Player({ id: id++, team, role: r.role, name: r.name, number: r.number, model, isHuman: r.isHuman, difficulty: this.difficulty });
+        player.slotIndex = r.slotIndex;
+        if (this.scene) this.scene.add(model.root);
+        if (r.isHuman) {
+          this.humans[team] = player;
+          if (team === this.localTeam) { this.human = player; model.showName(true); model.setMarker(0xb8ff3b); }
+        }
+        // Every player gets a brain; humans keep theirs suspended (used again when control moves away).
+        player.ai = r.isGK ? new GoalkeeperAI(player, teamAI, this.difficulty) : new AIPlayer(player, teamAI, this.difficulty);
+        if (r.isHuman) player.speedMult = 1;
         this.players.push(player);
-        this.allPlayers = this.allPlayers || [];
         this.allPlayers.push(player);
         this.teams[team].push(player);
-      });
+      }
       teamAI.setPlayers(this.teams[team]);
     }
+    if (!this.human) this.human = this.humans[TEAM.BLUE] || this.players[0];
     return this;
   }
 

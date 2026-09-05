@@ -12,7 +12,17 @@ export const DEFAULT_SETTINGS = {
   difficulty: 'NORMAL',        // EASY | NORMAL | HARD
   matchDuration: 300,
   invertY: false,
-  showControls: true
+  showControls: true,
+  shiftLockDefault: false,
+  // Mobile / touch controls
+  touchSensitivity: 1.0,
+  joystickSize: 1.0,
+  buttonSize: 1.0,
+  controlOpacity: 0.75,
+  leftHanded: false,
+  haptics: true,
+  touchTutorialSeen: false,
+  qualityAutoSet: false
 };
 
 export const DEFAULT_PROFILE = {

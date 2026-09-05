@@ -3,6 +3,7 @@ import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { DeviceInfo } from './DeviceInfo.js';
 
 const SHADOW_SIZES = { OFF: 0, LOW: 1024, MEDIUM: 2048, HIGH: 4096 };
 
@@ -75,7 +76,10 @@ export class SceneManager {
     const q = this.settings.get('graphicsQuality');
     const sq = this.settings.get('shadowQuality');
     const dpr = window.devicePixelRatio || 1;
-    this.renderer.setPixelRatio(q === 'LOW' ? Math.min(dpr, 1) : q === 'MEDIUM' ? Math.min(dpr, 1.5) : Math.min(dpr, 2));
+    // Touch-first devices (iPad, phones) get a lower pixel-ratio cap: retina 3x at full res is far too
+    // expensive for a mobile GPU and 1.5-1.75x still looks sharp on those screens.
+    const cap = DeviceInfo.touchFirst ? { LOW: 1, MEDIUM: 1.5, HIGH: 1.75 } : { LOW: 1, MEDIUM: 1.5, HIGH: 2 };
+    this.renderer.setPixelRatio(Math.min(dpr, cap[q] || 1.5));
 
     const size = SHADOW_SIZES[sq] ?? 2048;
     this.renderer.shadowMap.enabled = size > 0;

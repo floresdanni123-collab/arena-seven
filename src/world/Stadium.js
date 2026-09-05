@@ -7,12 +7,13 @@ import { rand } from '../utils/MathUtils.js';
  * a players' tunnel, and a gradient sky dome. Built once and reused for the menu and the match.
  */
 export class Stadium {
-  constructor() {
+  constructor({ crowdDensity = 1 } = {}) {
     this.group = new THREE.Group();
     this.group.name = 'Stadium';
     this.crowdMeshes = [];
     this.lightFixtures = [];
     this.time = 0;
+    this.crowdDensity = crowdDensity; // 1 = full crowd; lower on mobile / LOW quality
     this.build();
   }
 
@@ -86,7 +87,7 @@ export class Stadium {
       { name: 'south', axis: 'z', sign: 1, length: HALF_WIDTH * 2 + 8, inner: innerZ }
     ];
 
-    const seatsPerMeter = 1.6;
+    const seatsPerMeter = 1.6 * this.crowdDensity;
     const totalSeatsEstimate = sides.reduce((s, side) => s + Math.floor(side.length * seatsPerMeter) * tiers, 0);
     const bodyMesh = new THREE.InstancedMesh(seatGeo, new THREE.MeshStandardMaterial({ roughness: 0.9 }), totalSeatsEstimate);
     const headMesh = new THREE.InstancedMesh(headGeo, new THREE.MeshStandardMaterial({ roughness: 0.8 }), totalSeatsEstimate);

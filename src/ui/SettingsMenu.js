@@ -81,6 +81,17 @@ export class SettingsMenu {
     this.segmented('AI difficulty', 'difficulty', ['EASY', 'NORMAL', 'HARD']);
     this.segmented('Match length', 'matchDuration', [120, 300, 480], (v) => `${v / 60} MIN`);
     this.toggle('Show controls in HUD', 'showControls');
+    this.toggle('Shift lock default (C toggles in play)', 'shiftLockDefault');
+    const head = document.createElement('div');
+    head.className = 'setting-head';
+    head.textContent = 'MOBILE CONTROLS';
+    this.rows.appendChild(head);
+    this.slider('Touch camera sensitivity', 'touchSensitivity', 0.3, 3, 0.05, (v) => v.toFixed(2) + 'x');
+    this.slider('Joystick size', 'joystickSize', 0.7, 1.5, 0.05, (v) => Math.round(v * 100) + '%');
+    this.slider('Button size', 'buttonSize', 0.7, 1.5, 0.05, (v) => Math.round(v * 100) + '%');
+    this.slider('Control opacity', 'controlOpacity', 0.3, 1, 0.05);
+    this.toggle('Left-handed layout', 'leftHanded');
+    this.toggle('Haptics (vibration)', 'haptics');
   }
 
   show() { (this.refreshers || []).forEach((f) => f()); this.el.classList.remove('hidden'); }

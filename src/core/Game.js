@@ -19,6 +19,12 @@ import { SettingsMenu } from '../ui/SettingsMenu.js';
 import { LockerMenu } from '../ui/LockerMenu.js';
 import { StatsMenu } from '../ui/StatsMenu.js';
 import { DebugRenderer } from '../debug/DebugRenderer.js';
+import { NetworkClient } from '../net/NetworkClient.js';
+import { OnlineMatch } from '../net/OnlineMatch.js';
+import { MultiplayerMenu } from '../ui/MultiplayerMenu.js';
+import { CONN_STATE } from '../net/Protocol.js';
+import { TouchControls } from '../ui/TouchControls.js';
+import { DeviceInfo } from './DeviceInfo.js';
 import { TEAM, TEAM_NAMES, COLORS } from '../utils/Constants.js';
 import { rand } from '../utils/MathUtils.js';
 
@@ -32,10 +38,19 @@ export class Game {
   constructor(canvas) {
     this.canvas = canvas;
     this.settings = new Settings();
+    // First launch: pick a graphics preset that suits the device (touch-first devices start lower).
+    if (!this.settings.get('qualityAutoSet')) {
+      const q = DeviceInfo.suggestedQuality;
+      this.settings.set('graphicsQuality', q);
+      this.settings.set('shadowQuality', q === 'LOW' ? 'LOW' : q === 'MEDIUM' ? 'MEDIUM' : 'MEDIUM');
+      this.settings.set('qualityAutoSet', true);
+    }
     this.sceneManager = new SceneManager(canvas, this.settings);
     this.scene = this.sceneManager.scene;
     this.input = new InputManager(canvas);
+    if (DeviceInfo.touchFirst) this.input.setMode('touch');
     this.audio = new AudioManager(this.settings);
+    this.fps = { frames: 0, time: 0, avg: 60, lowSince: 0, suggested: false };
     this.assets = new AssetLoader();
     this.events = new EventBus();
     this.uiRoot = document.getElementById('ui-root');
@@ -73,14 +88,20 @@ export class Game {
     this.cinematic = new CinematicCamera(this.sceneManager.camera);
     this.buildShowcase();
 
-    setTimeout(() => { this.loadingEl.remove(); this.enterMenu(); }, 350);
+    setTimeout(() => {
+      this.loadingEl.remove();
+      this.enterMenu();
+      // A refresh mid-match: the stored reconnect token puts us straight back into the room.
+      if (this.net.loadStoredSession()) this.net.connect({ reconnect: true });
+    }, 350);
     this.loop();
   }
 
   buildArena() {
     this.pitch = new Pitch(this.assets);
     this.goals = [new Goal(-1), new Goal(1)];
-    this.stadium = new Stadium();
+    const q = this.settings.get('graphicsQuality');
+    this.stadium = new Stadium({ crowdDensity: q === 'LOW' ? 0.5 : q === 'MEDIUM' ? 0.8 : 1 });
     this.scene.add(this.pitch.group, this.goals[0].group, this.goals[1].group, this.stadium.group);
     this.arena = { pitch: this.pitch, goals: this.goals, stadium: this.stadium };
   }
@@ -90,6 +111,7 @@ export class Game {
     this.mainMenu = new MainMenu(this.uiRoot, {
       audio,
       onPlay: () => this.startMatch('match'),
+      onMultiplayer: () => this.openMultiplayer(),
       onTraining: () => this.startMatch('training'),
       onLocker: () => this.openPanel(this.lockerMenu),
       onStats: () => this.openPanel(this.statsMenu),
@@ -107,6 +129,20 @@ export class Game {
     });
     this.resultScreen = new ResultScreen(this.uiRoot, { audio, onRematch: () => this.startMatch(this.match ? this.match.mode : 'match'), onMenu: () => this.quitToMenu() });
     this.activePanel = null;
+    this.buildMultiplayer();
+
+    // Touch layer: feeds the same actions as keyboard/mouse; visible only in touch mode during a match.
+    this.touch = new TouchControls(this.uiRoot, this.input, this.settings, {
+      onPause: () => { if (this.state === GAME_STATE.MATCH) this.pauseMatch(); },
+      onSkip: () => { if (this.match && this.match.replays.isPlaying) this.match.replays.skip(); }
+    });
+    this.input.onModeChange((mode) => this.applyInputMode(mode));
+    this.applyInputMode(this.input.mode);
+    // Light haptics for the big moments (optional, ignored where unsupported).
+    const buzz = (ms) => this.touch.vibrate(ms);
+    this.events.on('goal_scored', () => buzz(40));
+    this.events.on('tackle_hit', ({ player, victim }) => { if (this.match && (player === this.match.human || victim === this.match.human)) buzz(25); });
+    this.events.on('kick', ({ player }) => { if (this.match && player === this.match.human) buzz(10); });
 
     // Gameplay event -> HUD feedback
     const teamCls = (team) => (team === TEAM.BLUE ? 'blue' : 'red');
@@ -148,6 +184,25 @@ export class Game {
     this.events.on('shootout_update', (s) => this.hud.setShootout(s));
     this.events.on('shootout_kick', ({ team, scored }) => this.hud.showBanner(scored ? 'GOAL!' : 'MISSED!', TEAM_NAMES[team], teamCls(team), 1400));
     this.events.on('toast', ({ text }) => this.hud.toast(text));
+    // Shift lock: remembered for the rest of the session so new matches keep the player's choice.
+    this.events.on('shift_lock', ({ enabled }) => { this.shiftLockSession = enabled; this.hud.setShiftLock(enabled, true); });
+  }
+
+  /** Switch HUD/controls presentation between desktop and touch (auto-detected from the last input device). */
+  applyInputMode(mode) {
+    const touch = mode === 'touch';
+    this.hud.setTouchMode(touch);
+    this.touch.setVisible(touch && this.state === GAME_STATE.MATCH);
+    if (touch) {
+      this.input.wantsPointerLock = false;
+      this.input.exitPointerLock();
+      document.body.style.cursor = 'default';
+      this.hud.setPointerHint(false);
+    } else if (this.state === GAME_STATE.MATCH) {
+      this.input.wantsPointerLock = true;
+      this.hud.setPointerHint(!this.input.pointerLocked);
+      document.body.style.cursor = 'none';
+    }
   }
 
   /* ------------------------------------------------------------ menu showcase */
@@ -184,6 +239,7 @@ export class Game {
     this.mainMenu.show();
     this.hud.hide();
     this.hud.setPointerHint(false);
+    if (this.touch) this.touch.setVisible(false);
     this.input.wantsPointerLock = false;
     this.input.exitPointerLock();
     this.audio.startMusic();
@@ -211,22 +267,38 @@ export class Game {
     this.showcaseBall.visible = false;
     this.audio.stopMusic();
     this.hud.reset();
-    this.match = new MatchManager({ sceneManager: this.sceneManager, assets: this.assets, settings: this.settings, audio: this.audio, events: this.events, input: this.input, arena: this.arena, mode }).start();
+    const initialShiftLock = this.shiftLockSession ?? !!this.settings.get('shiftLockDefault');
+    this.match = new MatchManager({ sceneManager: this.sceneManager, assets: this.assets, settings: this.settings, audio: this.audio, events: this.events, input: this.input, arena: this.arena, mode, initialShiftLock }).start();
+    this.hud.setShiftLock(initialShiftLock);
     this.state = GAME_STATE.MATCH;
     this.hud.show();
-    this.input.wantsPointerLock = true;
-    this.input.requestPointerLock();
-    this.hud.setPointerHint(!this.input.pointerLocked);
+    this.enterMatchInput();
     this.hud.showBanner(mode === 'training' ? 'TRAINING' : 'KICK OFF', mode === 'training' ? 'FREE PRACTICE' : `BLUE vs RED · ${Math.round(this.match.duration / 60)} MIN`, '', 2200);
-    document.body.style.cursor = 'none';
+  }
+
+  /** Pointer lock for mouse play, touch layer (and first-time tutorial) for touch play. */
+  enterMatchInput() {
+    if (this.input.mode === 'touch') {
+      this.input.wantsPointerLock = false;
+      this.touch.setVisible(true);
+      this.hud.setPointerHint(false);
+      document.body.style.cursor = 'default';
+      if (!this.settings.get('touchTutorialSeen')) this.touch.showTutorial(() => this.settings.set('touchTutorialSeen', true));
+    } else {
+      this.input.wantsPointerLock = true;
+      this.input.requestPointerLock();
+      this.hud.setPointerHint(!this.input.pointerLocked);
+      document.body.style.cursor = 'none';
+    }
   }
 
   pauseMatch() {
     if (this.state !== GAME_STATE.MATCH) return;
     this.state = GAME_STATE.PAUSED;
-    this.match.paused = true;
+    this.match.paused = !this.match.online; // an online match keeps running on the server
     this.input.wantsPointerLock = false;
     this.input.exitPointerLock();
+    this.touch.setVisible(false);
     this.pauseMenu.show();
     this.hud.setPointerHint(false);
     document.body.style.cursor = 'default';
@@ -238,18 +310,151 @@ export class Game {
     this.pauseMenu.hide();
     this.state = GAME_STATE.MATCH;
     this.match.paused = false;
-    this.input.wantsPointerLock = true;
-    this.input.requestPointerLock(); // called from the click handler so the gesture is valid
     this.input.clearAll();
-    document.body.style.cursor = 'none';
+    if (this.input.mode === 'touch') {
+      this.touch.setVisible(true);
+      document.body.style.cursor = 'default';
+    } else {
+      this.input.wantsPointerLock = true;
+      this.input.requestPointerLock(); // called from the click handler so the gesture is valid
+      document.body.style.cursor = 'none';
+    }
   }
 
   quitToMenu() {
+    if (this.match && this.match.online) this.leaveOnline();
     if (this.match) { this.match.dispose(); this.match = null; }
     this.closePanel();
     this.pauseMenu.hide();
     this.resultScreen.hide();
+    if (this.mpMenu) { this.mpMenu.hideResult(); this.mpMenu.setCountdown(null); this.mpMenu.setOpponentStatus(null); }
     this.enterMenu();
+  }
+
+  /* ------------------------------------------------------------ online multiplayer */
+
+  buildMultiplayer() {
+    this.net = new NetworkClient(NetworkClient.defaultUrl());
+    this.mpMenu = new MultiplayerMenu(this.uiRoot, {
+      audio: this.audio,
+      onFind: () => this.findMatch(),
+      onCancel: () => { this.net.cancelMatch(); },
+      onBack: () => { this.net.cancelMatch(); this.closePanel(); },
+      onRematch: () => { this.net.rematch(true); this.mpMenu.setRematchText('REMATCH REQUESTED · WAITING FOR OPPONENT'); },
+      onNewMatch: () => { this.leaveOnline(); if (this.match) { this.match.dispose(); this.match = null; } this.mpMenu.hideResult(); this.enterMenu(); this.openMultiplayer(); this.findMatch(); },
+      onMenu: () => this.quitToMenu()
+    });
+    const net = this.net;
+    net.events.on('state', ({ state }) => {
+      this.mpMenu.setConnection(state, net.identity ? net.identity.displayName : '');
+      if (state === CONN_STATE.RECONNECTING && this.match && this.match.online) this.mpMenu.setOpponentStatus('CONNECTION LOST<br><small>RECONNECTING...</small>');
+    });
+    net.events.on('welcome', (w) => {
+      this.mpMenu.setConnection(net.state, w.displayName);
+      if (this.match && this.match.online && w.resumed) this.mpMenu.setOpponentStatus('RECONNECTED<br><small>RESUMING MATCH</small>');
+      // Reconnected, but the server no longer knows our match (restart / grace expired): end it here.
+      if (this.match && this.match.online && !w.resumed && this.state !== GAME_STATE.RESULT) {
+        this.onOnlineMatchEnd({ reason: 'CONNECTION_LOST', winner: null, score: [...this.match.score], shootout: null });
+      }
+    });
+    net.events.on('queue', (q) => this.mpMenu.setQueue(q));
+    net.events.on('match_found', (m) => this.onMatchFound(m));
+    net.events.on('start_match', (m) => this.onStartOnline(m));
+    net.events.on('opponent', (o) => this.onOpponentStatus(o));
+    net.events.on('match_end', (e) => this.onOnlineMatchEnd(e));
+    net.events.on('rematch', (r) => this.onRematchMessage(r));
+    net.events.on('error', (e) => { if (e.code === 'RECONNECT_FAILED' && this.match && this.match.online) { this.mpMenu.setOpponentStatus(null); this.quitToMenu(); this.openMultiplayer(); this.mpMenu.showError('Connection to the server was lost.'); } else if (this.state === GAME_STATE.MENU) this.mpMenu.showError(e.message || e.code); });
+    net.events.on('disconnected', ({ wasInMatch }) => { if (!wasInMatch && this.state === GAME_STATE.MENU) this.mpMenu.setConnection(CONN_STATE.DISCONNECTED); });
+    // Browsers throttle timers in hidden tabs; let incoming snapshots drive the replica so it never stalls.
+    net.events.on('snapshot', () => { if (document.hidden && this.match && this.match.online && performance.now() - this.lastFrameAt > 45) this.frame(false); });
+  }
+
+  openMultiplayer() {
+    this.openPanel(this.mpMenu);
+    this.mpMenu.setConnection(this.net.state, this.net.identity ? this.net.identity.displayName : '');
+    if (this.net.state === CONN_STATE.DISCONNECTED) this.net.connect({ reconnect: true });
+  }
+
+  findMatch() {
+    if (this.net.state === CONN_STATE.DISCONNECTED) { this.net.connect({ reconnect: true }); this.pendingFind = true; const off = this.net.events.on('welcome', () => { off(); if (this.pendingFind) { this.pendingFind = false; this.net.findMatch('AUTO'); } }); return; }
+    this.net.findMatch('AUTO');
+  }
+
+  /** MATCH_FOUND (also sent on reconnect): build the replica match and report ready. */
+  onMatchFound(m) {
+    this.mpMenu.showFound(m);
+    this.mpMenu.setConnection(CONN_STATE.MATCH_FOUND, m.you.name);
+    this.mpMenu.hideResult();
+    setTimeout(() => this.startOnlineMatch(m), m.resumed ? 100 : 1800);
+  }
+
+  startOnlineMatch(descriptor) {
+    this.closePanel();
+    this.mainMenu.hide();
+    this.resultScreen.hide();
+    this.pauseMenu.hide();
+    if (this.match) { this.match.dispose(); this.match = null; }
+    this.showcase.root.visible = false;
+    this.showcaseBall.visible = false;
+    this.audio.stopMusic();
+    this.hud.reset();
+    const initialShiftLock = this.shiftLockSession ?? !!this.settings.get('shiftLockDefault');
+    this.match = new OnlineMatch({ sceneManager: this.sceneManager, assets: this.assets, settings: this.settings, audio: this.audio, events: this.events, input: this.input, arena: this.arena, net: this.net, descriptor, initialShiftLock }).start();
+    this.state = GAME_STATE.MATCH;
+    this.hud.show();
+    this.hud.setShiftLock(initialShiftLock);
+    this.enterMatchInput();
+    if (!descriptor.resumed) this.mpMenu.setCountdown('WAITING FOR OPPONENT');
+    else this.mpMenu.setOpponentStatus(null);
+  }
+
+  onStartOnline(m) {
+    if (!this.match || !this.match.online) return;
+    if (m.resumed) { this.mpMenu.setCountdown(null); return; }
+    // Countdown synchronised to the server's start timestamp.
+    const tick = () => {
+      if (!this.match || !this.match.online) return;
+      const left = (m.startAt - this.net.serverNow) / 1000;
+      if (left > 0.05) { this.mpMenu.setCountdown(String(Math.ceil(left))); setTimeout(tick, 120); }
+      else { this.mpMenu.setCountdown('KICK OFF'); this.audio.play('whistle', { volume: 0.6 }); setTimeout(() => this.mpMenu.setCountdown(null), 900); }
+    };
+    tick();
+  }
+
+  onOpponentStatus(o) {
+    if (!this.match || !this.match.online) return;
+    if (o.status === 'DISCONNECTED') { this.match.setOpponentStatus('DISCONNECTED'); this.mpMenu.setOpponentStatus(`OPPONENT DISCONNECTED<br><small>WAITING UP TO ${o.grace}S FOR THEM TO RETURN</small>`); }
+    else { this.match.setOpponentStatus('CONNECTED'); this.mpMenu.setOpponentStatus(o.status === 'RECONNECTED' ? 'OPPONENT RECONNECTED' : null); if (o.status === 'RECONNECTED') setTimeout(() => this.mpMenu.setOpponentStatus(null), 1500); }
+  }
+
+  onOnlineMatchEnd(e) {
+    if (!this.match || !this.match.online) return;
+    const localTeam = this.match.localTeam;
+    const won = e.winner === localTeam, lost = e.winner !== null && e.winner !== undefined && !won;
+    this.settings.addStats({ matches: 1, wins: won ? 1 : 0, losses: lost ? 1 : 0, draws: e.winner === null || e.winner === undefined ? 1 : 0, goalsFor: e.score[localTeam], goalsAgainst: e.score[1 - localTeam] });
+    this.hud.showBanner(e.reason === 'OPPONENT_DISCONNECTED' ? 'MATCH ENDED' : 'FULL TIME', won ? 'YOU WIN' : lost ? 'YOU LOSE' : 'DRAW', '', 2400);
+    this.mpMenu.setOpponentStatus(null);
+    setTimeout(() => {
+      if (!this.match || !this.match.online) return;
+      this.state = GAME_STATE.RESULT;
+      this.input.wantsPointerLock = false;
+      this.input.exitPointerLock();
+      this.hud.hide();
+      this.touch.setVisible(false);
+      this.mpMenu.showResult({ score: e.score, winner: e.winner, localTeam, shootout: e.shootout, reason: e.reason, opponent: this.match.opponentName });
+      document.body.style.cursor = 'default';
+    }, 2200);
+  }
+
+  onRematchMessage(r) {
+    if (r.declined) { this.mpMenu.setRematchText('OPPONENT LEFT · FIND A NEW MATCH'); return; }
+    if (r.accepted) { this.mpMenu.setRematchText('REMATCH ACCEPTED · TEAMS SWAPPED'); return; }
+    if (this.match && r.requestedBy !== this.match.localTeam) this.mpMenu.setRematchText('OPPONENT WANTS A REMATCH · PRESS REMATCH TO ACCEPT');
+  }
+
+  leaveOnline() {
+    if (this.net && this.net.state !== CONN_STATE.DISCONNECTED) this.net.leave();
+    if (this.mpMenu) { this.mpMenu.setCountdown(null); this.mpMenu.setOpponentStatus(null); }
   }
 
   onFullTime({ score, human, winner, shootout }) {
@@ -268,6 +473,7 @@ export class Game {
       this.input.wantsPointerLock = false;
       this.input.exitPointerLock();
       this.hud.hide();
+      this.touch.setVisible(false);
       this.resultScreen.show({ score, human, winner, shootout });
       document.body.style.cursor = 'default';
     }, 2500);
@@ -289,6 +495,22 @@ export class Game {
       // The browser releases the lock on ESC: treat that as pause.
       if (!locked && this.input.wantsPointerLock) this.pauseMatch();
     }
+  }
+
+  /** Rolling FPS average; suggest a lower preset once if the device clearly cannot keep up. */
+  monitorFps(dt) {
+    const f = this.fps;
+    f.frames++; f.time += dt;
+    if (f.time < 2) return;
+    f.avg = f.frames / f.time; f.frames = 0; f.time = 0;
+    const q = this.settings.get('graphicsQuality');
+    if (f.avg < 24 && q !== 'LOW' && !document.hidden) {
+      f.lowSince += 2;
+      if (f.lowSince >= 10 && !f.suggested) {
+        f.suggested = true;
+        this.hud.toast('LOW FRAME RATE · TRY A LOWER GRAPHICS PRESET IN SETTINGS', 4000);
+      }
+    } else f.lowSince = 0;
   }
 
   toggleDebug() {
@@ -336,15 +558,27 @@ export class Game {
         this.sceneManager.focusShadows(0, 0);
         break;
       case GAME_STATE.MATCH:
-        if (this.match.replays.isPlaying && this.input.wasPressed('Space')) this.match.replays.skip();
+        if (this.match.replays.isPlaying && this.input.pressed('SKIP')) this.match.replays.skip();
         this.match.update(dt);
         this.hud.update(this.match, this.audio);
+        if (this.touch.visible) {
+          this.touch.setContext({ mode: this.hud.controlMode, replay: this.match.replays.isPlaying, shiftLock: this.match.shiftLock && this.match.shiftLock.enabled, shootout: this.match.state === 'PENALTY_SHOOTOUT' });
+          this.touch.update(this.match);
+        }
+        this.monitorFps(dt);
         if (this.debugEnabled) this.debug.update(this.match);
         break;
       case GAME_STATE.PAUSED:
       case GAME_STATE.RESULT:
-        // Frozen: keep rendering the last frame of the match (players still animate idle).
-        if (this.match) for (const p of this.match.players) p.anim.update(dt);
+        if (this.match && this.match.online) {
+          // The server keeps playing: keep replicating, but send no input while a menu is open.
+          this.match.menuOpen = true;
+          this.match.update(dt);
+          this.match.menuOpen = false;
+          if (this.state === GAME_STATE.PAUSED) this.hud.update(this.match, this.audio);
+        } else if (this.match) {
+          for (const p of this.match.players) p.anim.update(dt); // frozen: idle animation only
+        }
         break;
       default: break;
     }

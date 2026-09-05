@@ -144,11 +144,23 @@ export const SET_PIECE = {
   AI_TAKE_DELAY_MIN: 0.8,
   AI_TAKE_DELAY_MAX: 1.6,
   PENALTY_RUNUP: 3.4,
+  HUMAN_TAKE_TIMEOUT: 14,   // an idle human taker loses the restart to the AI after this many seconds
   WALL_DISTANCE_MAX: 26,    // build a wall when the free kick is closer than this
   THROW_MIN_SPEED: 7,
   THROW_MAX_SPEED: 17,
   GOAL_KICK_OFFSET: 3.0,
   CORNER_INSET: 0.4
+};
+
+export const SHIFT_LOCK = {
+  SIDE_OFFSET: 1.1,          // camera sits this far to the player's right (over the shoulder)
+  HEIGHT: 1.55,
+  DISTANCE: 6.6,
+  KEEPER_SIDE_OFFSET: 0.85,
+  KEEPER_HEIGHT: 1.9,
+  KEEPER_DISTANCE: 6.4,
+  ROTATION_SPEED: 15,        // rad/s the player turns toward the camera's horizontal forward
+  TRANSITION: 0.22           // seconds to blend the camera between normal and shift-lock framing
 };
 
 export const REPLAY = {

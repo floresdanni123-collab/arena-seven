@@ -1,20 +1,23 @@
 {
   "name": "arena-football-7",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "server": "node server/server.js",
+    "dev:all": "concurrently -n client,server -c blue,green \"npm run dev\" \"npm run server\"",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:server": "node server/test/smoke.test.js"
   },
   "dependencies": {
-    "three": "^0.169.0"
+    "dotenv": "^16.4.5",
+    "three": "^0.169.0",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
+    "concurrently": "^9.0.1",
     "vite": "^5.4.21"
-  },
-  "allowScripts": {
-    "esbuild@0.21.5": true
   }
 }

@@ -1,0 +1,19 @@
+# Render blueprint: one web service that builds the client and serves it together with the
+# multiplayer WebSocket server. Free tier works for a 1v1 (it sleeps when idle; first load takes ~30s).
+services:
+  - type: web
+    name: arena-seven
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm run server
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CLIENT_ORIGIN
+        value: "*"
+      - key: MATCH_DURATION
+        value: "300"
+      - key: AI_DIFFICULTY
+        value: NORMAL
